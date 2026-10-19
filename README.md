@@ -1,4 +1,4 @@
-# pi-slack-bridge
+# omp-slack-bridge
 
 ![markdown formatting screenshot](media/markdown-formatting-screenshot.png)
 
@@ -108,7 +108,7 @@ Or install from local path:
 pi install /path/to/pi-slack-bridge
 ```
 
-For OMP, build the repository (`npm install && npm run build`) and let `~/.omp/agent/extensions/pi-slack-bridge.ts` re-export `../pi-slack-bridge/dist/bridge/index.js`.
+For OMP, clone this fork into `~/.omp/agent/pi-slack-bridge` (`git clone https://github.com/ChanwooKim01/omp-slack-bridge.git ~/.omp/agent/pi-slack-bridge`), build it (`npm install && npm run build`), and create `~/.omp/agent/extensions/pi-slack-bridge.ts` containing `export { default } from "../pi-slack-bridge/dist/bridge/index.js";`.
 
 ### 2. Configure Slack
 
@@ -259,8 +259,8 @@ Or set in config:
 ## Development
 
 ```bash
-git clone https://github.com/comsysto/pi-slack-bridge.git
-cd pi-slack-bridge
+git clone https://github.com/ChanwooKim01/omp-slack-bridge.git
+cd omp-slack-bridge
 npm install
 npm run build        # compile TypeScript
 npm run typecheck    # type-check without emitting
