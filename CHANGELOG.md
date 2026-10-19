@@ -2,6 +2,12 @@
 
 ## Local OMP adaptation — unreleased
 
+### Documentation and branding
+
+- README: step-by-step Slack app setup, including a ready-to-paste app manifest and the manual settings path.
+- Korean README (`README.ko.md`) with an English/Korean switch at the top.
+- Project banner (`media/banner.svg`, `media/banner.png`) replaces the upstream screenshot as the README hero image; app icon (`media/icon.svg`, `media/icon-512.png`) for the Slack app.
+
 ### Multi-session router and inbox
 
 Several OMP sessions (for example Paseo agents, each its own `omp` process) can now use one Slack DM at the same time, one thread per session, with no LLM relay. Slack delivers each Socket Mode event to one open connection per app token, so exactly one process — the router, the owner of `slk-bridge.lock` — holds the socket; it hands thread replies to the owning session through a per-session inbox.

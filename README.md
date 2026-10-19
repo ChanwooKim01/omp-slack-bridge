@@ -1,6 +1,8 @@
 # omp-slack-bridge
 
-![markdown formatting screenshot](media/markdown-formatting-screenshot.png)
+**English** · [한국어](README.ko.md)
+
+![omp-slack-bridge: one Slack DM, many OMP / Paseo agents, one thread each](media/banner.png)
 
 A **pi extension** that connects your [Pi agent harness](https://github.com/earendil-works/pi-coding-agent) terminal session to Slack via Socket Mode.
 
@@ -110,22 +112,72 @@ pi install /path/to/pi-slack-bridge
 
 For OMP, clone this fork into `~/.omp/agent/pi-slack-bridge` (`git clone https://github.com/ChanwooKim01/omp-slack-bridge.git ~/.omp/agent/pi-slack-bridge`), build it (`npm install && npm run build`), and create `~/.omp/agent/extensions/pi-slack-bridge.ts` containing `export { default } from "../pi-slack-bridge/dist/bridge/index.js";`.
 
-### 2. Configure Slack
+### 2. Create the Slack app
 
-Create a Slack app and enable **Socket Mode** in `Settings > Socket Mode`. You need both tokens:
+You need a Slack app with **Socket Mode** and two tokens: a **Bot Token** (`xoxb-...`) and an **App-Level Token** (`xapp-...`). Socket Mode means the bridge opens an outgoing connection to Slack, so you do not need a public URL, a server or port forwarding.
 
-- **Bot Token** (`xoxb-...`) — in **Settings > Install App**
-- **App-Level Token** (`xapp-...`) — create one in **Settings > Basic Information > App-Level Tokens** with the `connections:write` scope
+#### Fast way: create the app from a manifest
 
-In `Features > App Home` enable `Messages Tab` so you can interface with the App via DMs.
+1. Open <https://api.slack.com/apps> and click **Create New App**.
+2. Choose **From a manifest**, then pick your workspace.
+3. Select the **YAML** tab, replace the content with the manifest below, and click **Next** → **Create**.
 
-In `Features > Event Subscriptions` enable events and subscribe the bot to:
+   ```yaml
+   display_information:
+     name: oh-my-pi
+     description: Talk to your OMP / Paseo agents from Slack, one thread per session
+     background_color: "#1e1b4b"
+   features:
+     app_home:
+       home_tab_enabled: false
+       messages_tab_enabled: true
+       messages_tab_read_only_enabled: false
+     bot_user:
+       display_name: oh-my-pi
+       always_online: true
+   oauth_config:
+     scopes:
+       bot:
+         - chat:write
+         - reactions:write
+         - im:history
+         - im:write
+         - files:read
+         - files:write
+   settings:
+     event_subscriptions:
+       bot_events:
+         - message.im
+     interactivity:
+       is_enabled: false
+     org_deploy_enabled: false
+     socket_mode_enabled: true
+     token_rotation_enabled: false
+   ```
 
-- `message.im` — direct messages (the supported setup)
-- `message.channels` — public channels (only if you enable channels with `/enable`)
-- `message.groups` — private channels (same)
+   You can rename `oh-my-pi`. Drop `files:read` / `files:write` if you never send files between Slack and the agent.
+4. **App-Level Token.** In **Settings → Basic Information → App-Level Tokens**, click **Generate Token and Scopes**. Give it any name, add the scope `connections:write`, click **Generate**, and copy the `xapp-...` token.
+5. **Bot Token.** In **Settings → Install App**, click **Install to Workspace** → **Allow**. Copy the **Bot User OAuth Token** (`xoxb-...`).
+6. **Icon (optional).** In **Settings → Basic Information → Display Information**, upload [`media/icon-512.png`](media/icon-512.png) as the app icon.
 
-Bot Token scopes (in `Features > OAuth & Permissions`):
+#### Manual way
+
+If you prefer clicking through the settings, or you are fixing an existing app:
+
+1. **Settings → Socket Mode:** turn on **Enable Socket Mode**. Slack asks for an App-Level Token with `connections:write`; create it and copy the `xapp-...` token.
+2. **Features → App Home:** turn on **Messages Tab** and tick **Allow users to send Slash commands and messages from the messages tab**. Without this, you cannot DM the bot.
+3. **Features → Event Subscriptions:** turn on **Enable Events**, open **Subscribe to bot events**, and add:
+   - `message.im` — direct messages (the supported setup)
+   - `message.channels` — public channels (only if you enable channels with `/enable`)
+   - `message.groups` — private channels (same)
+4. **Features → OAuth & Permissions → Bot Token Scopes:** add the scopes from the table below.
+5. **Settings → Install App:** install (or **reinstall** after you changed scopes or events) and copy the `xoxb-...` token.
+
+> After you change scopes or events, Slack shows a yellow "reinstall your app" banner. The change takes effect only after the reinstall.
+
+#### Bot Token scopes
+
+(in `Features > OAuth & Permissions`)
 
 | Scope | Needed for |
 | --- | --- |
@@ -138,6 +190,8 @@ Bot Token scopes (in `Features > OAuth & Permissions`):
 | `files:read` | downloading files the user sends to pi — only if you use downloads |
 | `im:read` | optional: DM metadata for session management (channel IDs starting with `D` are recognised without it) |
 | `users:read` | optional: show display names instead of user IDs |
+
+### 3. Give the tokens to the bridge
 
 Configure the Slack Bridge via the interactive menu:
 
@@ -161,7 +215,7 @@ export PI_SLACK_BOT_TOKEN="xoxb-your-slack-bot-token"
 export PI_SLACK_APP_TOKEN="xapp-your-slack-app-token"
 ```
 
-### 3. Connect
+### 4. Connect
 
 ```bash
 /slk-bridge connect
@@ -169,11 +223,12 @@ export PI_SLACK_APP_TOKEN="xapp-your-slack-app-token"
 
 This joins the current session (see [Multi-session architecture](#multi-session-architecture)). Joined sessions rejoin automatically when their process starts; whether they also claim the Slack connection on their own is controlled by `autoConnect` in `~/.omp/agent/slk-bridge.json`.
 
-### 4. Authenticate a Slack User
+### 5. Authenticate a Slack User
 
-When a Slack user messages the bot for the first time, they receive a 6-digit challenge code. The code appears in the terminal of the router session (the session that holds the Slack connection).
-
-The user then enters the code in the bot chat to become the trusted Slack user for this bridge.
+1. In Slack, open the app's DM: click **Apps** in the sidebar (or search for the app name) and open its **Messages** tab.
+2. Send any message, for example `hi`. The first time, the bridge answers with a request for a 6-digit challenge code. The code appears in the terminal of the router session (the session that holds the Slack connection).
+3. Type the code into the DM. You are now the trusted Slack user for this bridge, and that DM becomes the paired chat.
+4. From now on, each joined session posts its own root message in this DM. Reply **in the thread** of a session's root message to talk to that session.
 
 > Only one Slack user is trusted at a time. After the first successful claim, other users are ignored until claiming is manually re-opened with `/slk-bridge releaseclaim` in a Pi terminal session.
 
@@ -186,6 +241,8 @@ The user then enters the code in the bot chat to become the trusted Slack user f
 - **Markdown Formatting** - Slack messages are now properly formatted with Markdown Blocks
 - **stop** - send `stop` in Slack to abort an agent turn. Inspired by [badlogic/pi-telegram](https://github.com/badlogic/pi-telegram)
 - **Reflect pi status in Slack message footer** - each latest message has a Slack footer annotation which reflects the state of your Pi agent (current path, model, context window,...)
+
+![markdown formatting screenshot](media/markdown-formatting-screenshot.png)
 
 ### tmux-backed Session Management
 

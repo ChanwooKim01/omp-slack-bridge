@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1e1b4b"/>
+      <stop offset="1" stop-color="#0f172a"/>
+    </linearGradient>
+    <linearGradient id="ic" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4338ca"/>
+      <stop offset="1" stop-color="#1e1b4b"/>
+    </linearGradient>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 z" fill="#a5b4fc"/>
+    </marker>
+  </defs>
+  <rect width="1280" height="640" fill="url(#bg)"/>
+
+  <!-- title block -->
+  <g transform="translate(64 64) scale(0.1875)">
+    <rect width="512" height="512" rx="112" fill="url(#ic)" stroke="#6366f1" stroke-width="8"/>
+    <path d="M96 128 h320 a40 40 0 0 1 40 40 v176 a40 40 0 0 1 -40 40 h-188 l-72 60 v-60 h-60 a40 40 0 0 1 -40 -40 v-176 a40 40 0 0 1 40 -40 z" fill="#fff"/>
+    <g fill="none" stroke="#312e81" stroke-width="16" stroke-linecap="round">
+      <path d="M168 256 C 240 256, 240 188, 330 188"/><path d="M168 256 L 330 256"/><path d="M168 256 C 240 256, 240 324, 330 324"/>
+    </g>
+    <circle cx="160" cy="256" r="34" fill="#312e81"/><circle cx="160" cy="256" r="14" fill="#fff"/>
+    <circle cx="352" cy="188" r="26" fill="#22c55e"/><circle cx="352" cy="256" r="26" fill="#f59e0b"/><circle cx="352" cy="324" r="26" fill="#ec4899"/>
+  </g>
+  <text x="180" y="112" font-size="52" font-weight="700" fill="#ffffff">omp-slack-bridge</text>
+  <text x="180" y="150" font-size="24" fill="#c7d2fe">One Slack DM. Many OMP / Paseo agents. One thread each.</text>
+
+  <!-- Slack DM card -->
+  <rect x="64" y="210" width="430" height="370" rx="20" fill="#ffffff"/>
+  <text x="92" y="252" font-size="22" font-weight="700" fill="#1d1c1d"># DM · oh-my-pi</text>
+  <line x1="64" y1="270" x2="494" y2="270" stroke="#e5e7eb" stroke-width="2"/>
+  <g font-size="19" fill="#1d1c1d">
+    <circle cx="104" cy="318" r="14" fill="#22c55e"/>
+    <text x="130" y="314" font-weight="700">📁 detector</text>
+    <text x="130" y="340" fill="#1264a3">3 replies</text>
+    <text x="440" y="326" font-size="24">⏳</text>
+    <circle cx="104" cy="410" r="14" fill="#f59e0b"/>
+    <text x="130" y="406" font-weight="700">📁 verifier</text>
+    <text x="130" y="432" fill="#1264a3">5 replies</text>
+    <text x="440" y="418" font-size="24">⏳</text>
+    <circle cx="104" cy="502" r="14" fill="#ec4899"/>
+    <text x="130" y="498" font-weight="700">📁 labeling</text>
+    <text x="130" y="524" fill="#1264a3">2 replies</text>
+    <text x="440" y="510" font-size="24">✅</text>
+  </g>
+
+  <!-- router -->
+  <line x1="500" y1="395" x2="600" y2="395" stroke="#a5b4fc" stroke-width="4" marker-end="url(#arr)"/>
+  <text x="520" y="380" font-size="16" fill="#a5b4fc">1 socket</text>
+  <rect x="610" y="335" width="190" height="120" rx="18" fill="#312e81" stroke="#6366f1" stroke-width="3"/>
+  <text x="705" y="388" font-size="24" font-weight="700" fill="#ffffff" text-anchor="middle">router</text>
+  <text x="705" y="420" font-size="16" fill="#c7d2fe" text-anchor="middle">thread → session</text>
+
+  <!-- fan out -->
+  <g stroke="#a5b4fc" stroke-width="4" fill="none" marker-end="url(#arr)">
+    <path d="M800 370 C 860 370, 860 270, 930 270"/>
+    <path d="M800 395 L 930 395"/>
+    <path d="M800 420 C 860 420, 860 520, 930 520"/>
+  </g>
+  <text x="786" y="500" font-size="16" fill="#a5b4fc">inbox</text>
+
+  <!-- agents -->
+  <g font-size="20" fill="#ffffff">
+    <rect x="940" y="228" width="276" height="84" rx="16" fill="#0b1220" stroke="#22c55e" stroke-width="3"/>
+    <text x="966" y="264" font-weight="700">agent A</text>
+    <text x="966" y="292" font-size="16" fill="#94a3b8">omp · Paseo</text>
+    <rect x="940" y="353" width="276" height="84" rx="16" fill="#0b1220" stroke="#f59e0b" stroke-width="3"/>
+    <text x="966" y="389" font-weight="700">agent B</text>
+    <text x="966" y="417" font-size="16" fill="#94a3b8">omp · Paseo</text>
+    <rect x="940" y="478" width="276" height="84" rx="16" fill="#0b1220" stroke="#ec4899" stroke-width="3"/>
+    <text x="966" y="514" font-weight="700">agent C</text>
+    <text x="966" y="542" font-size="16" fill="#94a3b8">omp · Paseo</text>
+  </g>
+  <text x="1078" y="600" font-size="16" fill="#94a3b8" text-anchor="middle">replies go straight back to their thread</text>
+</svg>
