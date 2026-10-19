@@ -3,7 +3,7 @@ import * as os from "os";
 import * as path from "path";
 import type { SlackBridgeConfig } from "../types/index.js";
 
-const CONFIG_DIR = path.join(os.homedir(), ".pi");
+const CONFIG_DIR = path.join(os.homedir(), ".omp", "agent");
 const CONFIG_PATH = path.join(CONFIG_DIR, "slk-bridge.json");
 
 /**
@@ -16,7 +16,8 @@ export function loadConfig(): SlackBridgeConfig {
     try {
       const stats = fs.statSync(CONFIG_PATH);
       const mode = stats.mode & 0o777;
-      if ((mode & 0o077) !== 0) {
+      // Windows protects this file with an ACL; stat().mode does not report that ACL.
+      if (process.platform !== "win32" && (mode & 0o077) !== 0) {
         console.warn(`⚠️  Config file ${CONFIG_PATH} has insecure permissions (${mode.toString(8)}). Should be 0600.`);
       }
 

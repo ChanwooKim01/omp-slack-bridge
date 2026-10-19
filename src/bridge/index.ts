@@ -31,6 +31,7 @@ import { loadConfig, saveConfig } from "../config/index.js";
 import {
   buildSessionListText,
   buildSlackFooterText,
+  buildSlackSessionRootText,
   getConversationHistory,
   getLastAssistantMessageInfo,
   listRecentSessions,
@@ -65,6 +66,7 @@ import {
   buildRemoteCommandList,
   getSlackHandoverReasonText,
 } from "./commands.js";
+import { installPaseoQuestions } from "./paseo-questions.js";
 
 export default function (pi: ExtensionAPI): void {
   let slackClient: SlackClient | null = null;
@@ -73,7 +75,7 @@ export default function (pi: ExtensionAPI): void {
   let ctx: ExtensionContext;
   let ownershipTimer: NodeJS.Timeout | undefined;
   let ownershipCheckInProgress = false;
-  const slackSessionThreads = new Map<string, string>();
+  const sessionRootPosts = new Map<string, Promise<string | undefined>>();
   let activeSlackReaction: { chatId: string; messageId: string } | null = null;
   let turnAccumulator: {
     chatId: string;
@@ -85,7 +87,48 @@ export default function (pi: ExtensionAPI): void {
     resolve: () => void;
     reject: (err: Error) => void;
   } | null = null;
-  const handoffDir = path.join(os.homedir(), ".pi", "slk-bridge-handoffs");
+  const handoffDir = path.join(os.homedir(), ".omp", "agent", "slk-bridge-handoffs");
+  const questions = installPaseoQuestions(pi, async (text, target) => {
+    if (!ownsBridgeConnection() || !slackIsConnected()) return undefined;
+    const chatId = target?.chatId ?? auth.getNotificationChatId();
+    if (!chatId) return undefined;
+    // Pin the session at alert time so a session switch mid-post cannot remap this thread.
+    // Replies into an existing question thread keep that thread's owner, which may be an earlier session.
+    const sessionPath = (target && getSlackThreadOwnerSession(chatId, target.threadId)) || getCurrentSessionFile();
+    let threadId = target?.threadId;
+    let notification = text;
+    if (!threadId) {
+      threadId = sessionPath ? await ensureSessionThread(chatId, sessionPath) : undefined;
+      const owner = loadConfig().auth?.trustedUser?.split(":")[0];
+      if (owner && /^[UW][A-Z0-9]+$/.test(owner)) notification = `<@${owner}> ${text}`;
+    }
+    let postedTs: string | undefined;
+    const postedThreadId = await sendToRemoteChat(chatId, notification, {
+      ...(threadId ? { threadId } : { forceTopLevel: true }),
+      noFooter: true,
+      rememberThreadForSessionPath: sessionPath,
+      onPosted: ts => { postedTs = ts; },
+    });
+    return postedThreadId ? { chatId, threadId: postedThreadId, postedTs } : undefined;
+  });
+
+  /** One top-level root per session; concurrent alerts share a single in-flight root post. */
+  async function ensureSessionThread(chatId: string, sessionPath: string): Promise<string | undefined> {
+    const existing = getRememberedSlackThreadForCurrentSession(chatId, () => sessionPath);
+    if (existing) return existing;
+    const key = `${sessionPath}:${chatId}`;
+    let post = sessionRootPosts.get(key);
+    if (!post) {
+      post = (async () => sendToRemoteChat(chatId, await buildSlackSessionRootText(ctx), {
+        forceTopLevel: true,
+        noFooter: true,
+        rememberThreadForSessionPath: sessionPath,
+      }))();
+      sessionRootPosts.set(key, post);
+      void post.catch(() => {}).finally(() => sessionRootPosts.delete(key));
+    }
+    return post.catch(() => undefined);
+  }
 
   // ── Short-lived helpers (bridge state accessors) ──────────────────────────
 
@@ -130,7 +173,7 @@ export default function (pi: ExtensionAPI): void {
 
   /** Resolve a thread ID: prefer explicit, fall back to remembered */
   function resolveThreadId(chatId: string, explicitThreadId?: string): string | undefined {
-    return explicitThreadId || getRememberedSlackThreadForCurrentSession(chatId, slackSessionThreads, getCurrentSessionFile);
+    return explicitThreadId || getRememberedSlackThreadForCurrentSession(chatId, getCurrentSessionFile);
   }
 
   // ── Handoff directory ────────────────────────────────────────────────────
@@ -197,6 +240,7 @@ export default function (pi: ExtensionAPI): void {
       forceTopLevel?: boolean;
       rememberThreadForSessionPath?: string;
       noFooter?: boolean;
+      onPosted?: (lastTs: string) => void;
     },
   ): Promise<string | undefined> {
     const slack = getSlackClient();
@@ -206,7 +250,7 @@ export default function (pi: ExtensionAPI): void {
       ? undefined
       : resolveThreadId(chatId, options?.threadId);
     const footerText = options?.noFooter ? undefined : await buildSlackFooterText(ctx);
-    const rootThreadTs = await slack.sendMessageInThread(chatId, text, threadTs, footerText);
+    const rootThreadTs = await slack.sendMessageInThread(chatId, text, threadTs, footerText, options?.onPosted);
     if (rootThreadTs) {
       rememberSlackThreadForSession(chatId, rootThreadTs, options?.rememberThreadForSessionPath, getCurrentSessionFile);
     }
@@ -511,7 +555,8 @@ export default function (pi: ExtensionAPI): void {
   }
 
   async function maybeRouteSlackMessageToMappedSession(message: ExternalMessage): Promise<boolean> {
-    if (message.isGroupChat || !message.threadId) {
+    // Channels host one thread per session too, so a reply in another session's thread must not reach this agent.
+    if (!message.threadId) {
       return false;
     }
 
@@ -523,7 +568,11 @@ export default function (pi: ExtensionAPI): void {
     const mappedSessionPath = getSlackThreadOwnerSession(message.chatId, message.threadId);
 
     if (message.isThreadReply && mappedSessionPath && mappedSessionPath !== currentSessionPath) {
-      await handoffSlackThreadToSession(message, mappedSessionPath);
+      // Keep the thread owned by its session; the notice is not a reason to remap it here.
+      await sendToRemoteChat(message.chatId, "이전 세션의 스레드입니다. Paseo에서 해당 대화를 열고 새 질문 알림에 답변하세요.", {
+        threadId: message.threadId,
+        rememberThreadForSessionPath: mappedSessionPath,
+      });
       return true;
     }
 
@@ -538,6 +587,7 @@ export default function (pi: ExtensionAPI): void {
       replayLastAssistantMessage?: boolean;
     },
   ): Promise<void> {
+    if (await questions.receive(message)) return;
     if ((options?.allowSessionRouting ?? true) && await maybeRouteSlackMessageToMappedSession(message)) {
       return;
     }
@@ -936,13 +986,25 @@ export default function (pi: ExtensionAPI): void {
     }
 
     try {
-      await connectCurrentSession({ respectAutoConnect: true, handoverReason: "active-session" });
+      await connectCurrentSession({ respectAutoConnect: true, handoverReason: "active-session", notifySlackHandover: false });
     } catch (err) {
       ctx.ui.notify(
         `⚠️ slk-bridge could not move to this active session: ${(err as Error).message}`,
         "warning",
       );
     }
+  });
+  pi.on("message_end", async (event, context) => {
+    if (pendingRemoteChat || handoverPending || !ownsBridgeConnection()) return;
+    ctx = context;
+    const chatId = auth.getNotificationChatId();
+    if (!chatId) return;
+    const threadId = resolveThreadId(chatId);
+    if (!threadId) return;
+    const message = event.message;
+    if (message.role !== "assistant" || message.stopReason !== "stop") return;
+    const text = extractTextFromMessage(message);
+    if (text) await sendToRemoteChat(chatId, text, { threadId, noFooter: true });
   });
 
   pi.on("turn_start", async (_event, _context) => {

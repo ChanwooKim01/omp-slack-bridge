@@ -17,6 +17,23 @@ Summarized featureset:
 
 Currently only one terminal session at a time can be bridged to Slack. When another session connects, ownership of the Slack bridge is transferred to that session.
 
+## Local OMP / Paseo adaptation
+
+New question alerts mention only the configured trusted user. Phone push delivery still depends on Slack and OS notification settings. Automatic session takeover does not replay conversation history; local question alerts and final answers omit the prompt-preview footer. Explicit upstream handover/replay commands remain opt-in.
+
+This checkout is based on `comsysto/pi-slack-bridge` 0.3.0. It is not an unmodified upstream installation.
+
+- OMP loads the built extension through `~/.omp/agent/extensions/pi-slack-bridge.ts`. New OMP sessions, including sessions launched by Paseo, discover it automatically.
+- Configuration and the single-owner lock live under `~/.omp/agent/`. `slk-bridge.json` contains credentials: do not commit or share it. The installed Windows file is protected by an owner/SYSTEM ACL; POSIX installations use file mode 0600.
+- OMP `ask` questions appear in the normal app UI and in a dedicated Slack thread. Reply in the question's thread using a choice number, its exact label, or free text. For several questions, use one `question-id: answer` line per question.
+- The first explicit answer wins. The other dialog is cancelled; late replies to a completed question thread do not start a new turn. Cancellation or a missing answer is never approval.
+- Native tool-permission requests may notify Slack, but their approval remains in Paseo/OMP. Slack replies do not bypass tool permissions.
+- This retains upstream's **one active bridged session** model. Use Paseo to create and switch sessions. The upstream tmux/Pi session-spawning commands are not the supported Windows/Paseo workflow.
+- Existing configured channel/user authorization is reused. File-transfer scopes are not enabled by this setup. Optional Slack user/channel metadata scopes are not required for text question replies.
+
+Use `/slk-bridge status`, `/slk-bridge connect`, or `/slk-bridge disconnect` in the connected OMP session. Rebuild with `npm run build` after source changes, then start a new OMP session. Upstream updates must preserve the local question adapter and configuration-path changes.
+
+
 ## Setup
 
 ### 1. Install

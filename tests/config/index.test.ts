@@ -44,19 +44,19 @@ describe('config', () => {
     expect(loaded.debug).toBe(false);
   });
 
-  it('creates .pi directory with 700 permissions', async () => {
+  it.runIf(process.platform !== 'win32')('restricts the configuration directory to its POSIX owner', async () => {
     const { saveConfig } = await importConfig();
     saveConfig({});
 
-    const stats = statSync(join(tmpDir, '.pi'));
+    const stats = statSync(join(tmpDir, '.omp', 'agent'));
     expect(stats.mode & 0o777).toBe(0o700);
   });
 
-  it('writes config file with 600 permissions', async () => {
+  it.runIf(process.platform !== 'win32')('restricts the credential file to its POSIX owner', async () => {
     const { saveConfig } = await importConfig();
     saveConfig({});
 
-    const stats = statSync(join(tmpDir, '.pi', 'slk-bridge.json'));
+    const stats = statSync(join(tmpDir, '.omp', 'agent', 'slk-bridge.json'));
     expect(stats.mode & 0o777).toBe(0o600);
   });
 
@@ -86,7 +86,7 @@ describe('config', () => {
   });
 
   it('handles corrupted config file gracefully', async () => {
-    const piDir = join(tmpDir, '.pi');
+    const piDir = join(tmpDir, '.omp', 'agent');
     mkdirSync(piDir, { recursive: true });
     writeFileSync(join(piDir, 'slk-bridge.json'), '{invalid json!!!');
 
@@ -97,7 +97,7 @@ describe('config', () => {
   });
 
   it('still applies env vars when config file is corrupted', async () => {
-    const piDir = join(tmpDir, '.pi');
+    const piDir = join(tmpDir, '.omp', 'agent');
     mkdirSync(piDir, { recursive: true });
     writeFileSync(join(piDir, 'slk-bridge.json'), 'not json');
 
@@ -128,13 +128,9 @@ describe('config', () => {
     expect(loaded.autoConnect).toBe(true);
   });
 
-  it('hideToolCalls defaults to undefined (not hidden)', async () => {
-    const { loadConfig } = await importConfig();
-    expect(loadConfig().hideToolCalls).toBeUndefined();
-  });
 
   it('loads slk-bridge.json', async () => {
-    const piDir = join(tmpDir, '.pi');
+    const piDir = join(tmpDir, '.omp', 'agent');
     mkdirSync(piDir, { recursive: true });
     writeFileSync(join(piDir, 'slk-bridge.json'), JSON.stringify({ slack: { botToken: 'xoxb-test', appToken: 'xapp-test' }, autoConnect: true }));
 

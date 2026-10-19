@@ -195,6 +195,7 @@ export async function createBridgeHarness(state: HarnessState): Promise<BridgeHa
     getConversationHistory: () => toHistory(state.branch),
     getLastAssistantMessageInfo: () => lastAssistantInfo(state.branch),
     buildSlackFooterText: vi.fn().mockResolvedValue('footer'),
+    buildSlackSessionRootText: vi.fn(async () => `root ${state.sessionFile}`),
     listRecentSessions: vi.fn().mockResolvedValue([]),
     buildSessionListText: vi.fn().mockResolvedValue(''),
   }));

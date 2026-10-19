@@ -1,5 +1,19 @@
 # Changelog
 
+## Local OMP adaptation — unreleased
+
+- Post one top-level root per session (`📁 project (branch) · path` plus the first prompt) and send that session's question alerts and permission notices as owner-mentioned replies in its thread, so parallel sessions no longer pile up top-level messages.
+- Resolve the remembered thread from the persisted per-session mapping only; the old chat-keyed in-memory cache could reuse a previous session's thread after `/new`, `/resume`, or a branch. Alerts pin the session that raised them, so a session switch mid-post cannot remap the thread.
+- Apply the "previous session's thread" guard to channels as well as DMs, and keep that thread owned by its session when the notice is sent, so a reply in another session's thread never becomes the active session's prompt.
+- Omit prompt-preview footers from local alerts/answers, and disable automatic history replay on session takeover.
+
+- Add an OMP question adapter: keep the normal app dialog and send the same question to Slack; accept the first explicit answer and cancel the competing dialog.
+- Ignore late answers (option number, option label, or `id: answer`) to a closed question in its thread and say so; ordinary messages in the shared session thread still reach the agent. A Slack reply answers a pending question only if it was posted after that question's alert. Cancel decisions on session changes instead of granting implicit approval.
+- Reuse the configured trusted user/channel, retain channel thread IDs without optional metadata permissions, and suppress duplicate message deliveries within the running connection.
+- Store the local OMP bridge configuration and lock under `~/.omp/agent/`; use Windows ACL protection rather than interpreting POSIX mode bits as Windows permissions.
+- Keep the upstream single-active-session model. Use Paseo, not tmux/Pi commands, for Windows session management.
+
+
 ## [0.3.0] - 2026-08-18
 
 ### Added

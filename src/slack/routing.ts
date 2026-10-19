@@ -101,19 +101,11 @@ export function getSlackThreadOwnerSession(chatId: string, threadTs?: string): s
 
 export function getRememberedSlackThreadForCurrentSession(
   chatId: string,
-  slackSessionThreads: Map<string, string>,
   getCurrentSessionFile?: () => string | undefined,
 ): string | undefined {
-  const inMemory = slackSessionThreads.get(chatId);
-  if (inMemory) return inMemory;
-
+  // Always read the persisted per-session mapping: a process-wide cache keyed by chat leaked
+  // one session's thread into the next session after /new, /resume, or a branch.
   const sessionPath = getCurrentSessionFile?.();
   if (!sessionPath) return undefined;
-
-  const { activeThreadBySessionChat } = getSlackRoutingState();
-  const threadTs = activeThreadBySessionChat[getSlackSessionChatKey(sessionPath, chatId)]?.threadTs;
-  if (threadTs) {
-    slackSessionThreads.set(chatId, threadTs);
-  }
-  return threadTs;
+  return getSlackRoutingState().activeThreadBySessionChat[getSlackSessionChatKey(sessionPath, chatId)]?.threadTs;
 }

@@ -103,6 +103,15 @@ export async function buildSlackFooterText(ctx: SessionContext): Promise<string>
   return `${location} · ${formatContextUsage(ctx)} · (${modelProvider}) ${modelId} · ${firstPrompt}`;
 }
 
+/** Top-level label of a session's Slack thread; the project comes first so parallel sessions stay distinguishable. */
+export async function buildSlackSessionRootText(ctx: SessionContext): Promise<string> {
+  const displayPath = formatDisplayPath(ctx.cwd);
+  const project = path.basename(ctx.cwd) || displayPath;
+  const branch = await getGitBranch(ctx.cwd);
+  const firstPrompt = truncate(getFirstSessionPrompt(ctx.sessionManager).replace(/\s+/g, " ").trim(), 120);
+  return `📁 **${project}**${branch ? ` (${branch})` : ""} · ${displayPath}\n${firstPrompt || "새 세션"}`;
+}
+
 // ── Conversation helpers ───────────────────────────────────────────────────
 
 /** Safely extract text from any message (handles string content and array content) */

@@ -16,7 +16,7 @@ import * as path from "path";
  * disconnect themselves on their next ownership check.
  */
 
-const CONFIG_DIR = path.join(os.homedir(), ".pi");
+const CONFIG_DIR = path.join(os.homedir(), ".omp", "agent");
 const LOCK_PATH = path.join(CONFIG_DIR, "slk-bridge.lock");
 
 const g = global as any;

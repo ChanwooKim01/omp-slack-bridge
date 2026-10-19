@@ -64,7 +64,7 @@ export class SlackClient {
   private botUserId: string = "";
   private messageHandler?: (message: ExternalMessage) => void;
   private errorHandler?: (error: Error) => void;
-  private lastProcessedMessageId = "";
+  private processedMessageIds = new Set<string>();
 
   // Cache user info to avoid repeated API calls
   private userCache: Map<string, string> = new Map();
@@ -203,6 +203,11 @@ export class SlackClient {
       const userId = message.user;
       const channelId = message.channel;
       const ts = message.ts;
+      const pairing = this.auth.exportConfig();
+      const trustedUser = pairing.trustedUser?.split(":")[0];
+      if (trustedUser && userId !== trustedUser) return;
+      const pairedChat = trustedUser ? pairing.userChats?.[trustedUser] : undefined;
+      if (pairedChat && channelId !== pairedChat) return;
 
       const content = await this.buildIncomingContent(message);
       if (!content) {
@@ -210,10 +215,12 @@ export class SlackClient {
       }
 
       // Filter out duplicate messages
-      if (ts === this.lastProcessedMessageId) {
-        return;
+      if (this.processedMessageIds.has(`${channelId}:${ts}`)) return;
+      this.processedMessageIds.add(`${channelId}:${ts}`);
+      if (this.processedMessageIds.size > 4096) {
+        const oldest = this.processedMessageIds.values().next().value;
+        if (oldest) this.processedMessageIds.delete(oldest);
       }
-      this.lastProcessedMessageId = ts;
 
       // Get username from cache or fetch
       let username: string = this.userCache.get(userId) || userId;
@@ -242,8 +249,8 @@ export class SlackClient {
           channelInfo = { isDM, name };
           this.channelCache.set(channelId, channelInfo);
         } catch {
-          // Default to assuming it's a DM if we can't fetch info
-          channelInfo = { isDM: true };
+          // Channel IDs remain authoritative when optional metadata scopes are absent.
+          channelInfo = { isDM: channelId.startsWith("D") };
           this.channelCache.set(channelId, channelInfo);
         }
       }
@@ -254,10 +261,9 @@ export class SlackClient {
         : false;
 
       const isGroupChat = !channelInfo.isDM;
-      const effectiveThreadId = !isGroupChat
-        ? (typeof message.thread_ts === "string" && message.thread_ts.trim() ? message.thread_ts : ts)
-        : undefined;
-      const isThreadReply = !isGroupChat && typeof message.thread_ts === "string" && message.thread_ts.trim().length > 0;
+      const effectiveThreadId = typeof message.thread_ts === "string" && message.thread_ts.trim()
+        ? message.thread_ts : (!isGroupChat ? ts : undefined);
+      const isThreadReply = typeof message.thread_ts === "string" && message.thread_ts.trim().length > 0;
 
       // Check authorization
       const sendMessageToUser = async (cId: string, text: string) => {
@@ -377,6 +383,7 @@ export class SlackClient {
     text: string,
     threadTs?: string,
     footerText?: string,
+    onPosted?: (lastTs: string) => void,
   ): Promise<string | undefined> {
     if (!this.app) {
       throw new Error("Slack not connected");
@@ -407,6 +414,7 @@ export class SlackClient {
         if (!rootThreadTs) {
           rootThreadTs = response.ts;
         }
+        if (i === messageChunks.length - 1 && response.ts) onPosted?.(response.ts);
       }
 
       return rootThreadTs;
