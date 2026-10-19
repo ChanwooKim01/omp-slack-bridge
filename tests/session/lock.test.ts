@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { buildChildModules, runChild } from '../helpers/child-process';
 
 describe('lock', () => {
   let tmpDir: string;
@@ -152,4 +153,94 @@ describe('lock', () => {
     expect(isLockHeldLocally()).toBe(true);
     expect(isCurrentLockOwner()).toBe(false);
   });
+
+  it('reports whether a process is alive', async () => {
+    const { isProcessAlive } = await importLock(tmpDir);
+
+    expect(isProcessAlive(process.pid)).toBe(true);
+    expect(isProcessAlive(1073741824)).toBe(false);
+  });
+
+  it('replaces an old unreadable lock record instead of staying locked out forever', async () => {
+    const piDir = join(tmpDir, '.omp', 'agent');
+    mkdirSync(piDir, { recursive: true });
+    const lockFile = join(piDir, 'slk-bridge.lock');
+    writeFileSync(lockFile, 'not-a-lock-record');
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(lockFile, old, old);
+
+    const { acquireLock } = await importLock(tmpDir);
+
+    expect(acquireLock()).toBe(true);
+    expect(readFileSync(lockFile, 'utf-8')).toBe(`${process.pid}:${g.__slkBridgeInstanceId}`);
+  });
+
+  // The exclusive create happens before the record is written, so another claimant can see an
+  // empty file for a moment. That file is a claim in progress, not garbage to clean up.
+  it('leaves a freshly created, still empty lock file to the claimant that is writing it', async () => {
+    const piDir = join(tmpDir, '.omp', 'agent');
+    mkdirSync(piDir, { recursive: true });
+    const lockFile = join(piDir, 'slk-bridge.lock');
+    writeFileSync(lockFile, '');
+
+    const { acquireLock } = await importLock(tmpDir);
+
+    expect(acquireLock()).toBe(false);
+    expect(g.__slkBridgeConnected).toBeFalsy();
+    expect(existsSync(lockFile)).toBe(true);
+    expect(readFileSync(lockFile, 'utf-8')).toBe('');
+  });
+
+  // Real clock and real processes on purpose: the claim race only exists between OS processes,
+  // and fake timers cannot reach them. Many rounds, each with its own lock file and every process
+  // firing within the same millisecond, make an unguarded check-then-write fail reliably.
+  it('lets exactly one of several simultaneous claimants win, round after round', async () => {
+    const modules = join(tmpDir, 'modules');
+    buildChildModules(modules, ['session/lock']);
+    const worker = join(modules, 'claimant.mjs');
+    writeFileSync(worker, `
+      import * as path from 'node:path';
+      const [base, startAt, rounds, holdUntil] = process.argv.slice(2);
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+      // One module instance per round, each bound to that round's home directory (its own lock file).
+      const claims = [];
+      for (let round = 0; round < Number(rounds); round++) {
+        process.env.HOME = process.env.USERPROFILE = path.join(base, 'round-' + round);
+        claims.push((await import('./session/lock.js?round=' + round)).acquireLock);
+      }
+
+      // Sleep until shortly before the first round; only the last stretch is spun for precision.
+      await sleep(Math.max(0, Number(startAt) - Date.now() - 50));
+      const results = [];
+      for (let round = 0; round < claims.length; round++) {
+        const roundStart = Number(startAt) + round * 25;
+        while (Date.now() < roundStart) { /* spin: every process fires in the same millisecond */ }
+        results.push(claims[round]());
+      }
+      // Stay alive until every process has finished, so a winner's lock cannot look stale mid-race.
+      while (Date.now() < Number(holdUntil)) await sleep(5);
+      console.log('results:' + JSON.stringify(results));
+    `);
+
+    const claimants = 6;
+    const rounds = 30;
+    const startAt = Date.now() + 3000;
+    const holdUntil = startAt + rounds * 25 + 1500;
+    const results = await Promise.all(
+      Array.from({ length: claimants }, () =>
+        runChild(worker, [tmpDir, String(startAt), String(rounds), String(holdUntil)], tmpDir),
+      ),
+    );
+
+    for (const result of results) expect(result, result.stderr).toMatchObject({ code: 0 });
+    const claimsByProcess: boolean[][] = results.map((result) => {
+      const line = result.stdout.split('\n').find((entry) => entry.startsWith('results:'));
+      return JSON.parse(line?.slice('results:'.length) ?? '[]');
+    });
+    for (let round = 0; round < rounds; round++) {
+      const winners = claimsByProcess.filter((claims) => claims[round]).length;
+      expect(winners, `round ${round}`).toBe(1);
+    }
+  }, 60_000);
 });

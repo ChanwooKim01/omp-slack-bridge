@@ -4,18 +4,35 @@
 
 // ── Bridge status text ─────────────────────────────────────────────────────
 
-export function buildBridgeStatusText(
-  slackConnected: boolean,
-  trustedUser: string | undefined,
-  channels: number,
-): string {
+export interface BridgeStatus {
+  /** This session is registered with the bridge: it can post to its Slack thread and receives routed replies. */
+  joined: boolean;
+  /** Who holds the one Slack Socket Mode connection. */
+  router: "this-session" | "other-session" | "none";
+  /** This process has the Slack socket open. */
+  socketOpen: boolean;
+  /** Joined sessions claim the router role on their own when no live router exists. */
+  autoConnect: boolean;
+  trustedUser: string | undefined;
+  channels: number;
+}
+
+export function buildBridgeStatusText(status: BridgeStatus): string {
+  const routerText =
+    status.router === "this-session"
+      ? `this session (socket ${status.socketOpen ? "open" : "not open"})`
+      : status.router === "other-session"
+        ? "another session"
+        : "none — Slack messages are not being received";
   const lines = [
     "━━━ Slack Bridge Status ━━━",
     "",
-    `  ${slackConnected ? "●" : "○"} Slack`,
+    `  ${status.joined ? "●" : "○"} Session ${status.joined ? "joined" : "not joined (run /slk-bridge connect)"}`,
+    `  ${status.router === "this-session" && status.socketOpen ? "●" : "○"} Router: ${routerText}`,
     "",
-    `Trusted user: ${trustedUser ?? "None"}`,
-    `Channels: ${channels}`,
+    `Auto-claim router: ${status.autoConnect ? "on" : "off"}`,
+    `Trusted user: ${status.trustedUser ?? "None"}`,
+    `Channels: ${status.channels}`,
     "━━━━━━━━━━━━━━━━━━━━━━━━━━━",
   ];
 
@@ -82,38 +99,26 @@ export function buildBridgeHelpText(): string {
     "",
     "/slk-bridge                   Open interactive menu",
     "/slk-bridge help              Show this help",
-    "/slk-bridge status            Show Slack connection and user status",
-    "/slk-bridge connect           Connect to Slack",
-    "/slk-bridge disconnect        Disconnect from Slack",
+    "/slk-bridge status            Show join, router and user status",
+    "/slk-bridge connect           Join this session to the bridge (becomes router if none is live)",
+    "/slk-bridge disconnect        Leave the bridge (releases the router role if held)",
+    "/slk-bridge router            Take the router role (the one Slack socket) from another session",
     "/slk-bridge configure <bot-token> <app-token>",
     "                              Configure Slack bot",
     "/slk-bridge widget            Toggle status widget on/off",
-    "/slk-bridge autoconnect       Toggle auto-connect on session switch",
+    "/slk-bridge autoconnect       Toggle auto-claiming the router role when no router is live",
     "/slk-bridge new [cwd]         Start a fresh bridge session for current or specified directory",
     "/slk-bridge resume             List recent sessions (default 10)",
     "/slk-bridge resume list [number]  Show more sessions (default 10)",
     "/slk-bridge resume <number>   Resume one of all recent sessions",
     "/slk-bridge sendfile <path>   Upload a local file to current Slack chat",
     "/slk-bridge releaseclaim      Re-open claiming for Slack",
-    "/slk-bridge optout            Opt this session out of automatic bridge takeover",
-    "/slk-bridge optin             Re-allow this session to take over the bridge",
-    "/slk-bridge optout list       Show sessions opted out of takeover",
+    "/slk-bridge optout            Never auto-claim the router role in this session",
+    "/slk-bridge optin             Allow this session to auto-claim the router role again",
+    "/slk-bridge optout list       Show sessions that never auto-claim the router role",
     "/slk-bridge handover          Push terminal session to Slack",
     "/slk-bridge toggletools       Toggle tool call visibility",
     "",
     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
   ].join("\n");
-}
-
-// ── Handover reason text ───────────────────────────────────────────────────
-
-export function getSlackHandoverReasonText(reason?: "user-request" | "active-session"): string {
-  switch (reason) {
-    case "user-request":
-      return "Switched by user request.";
-    case "active-session":
-      return "Bridge moved to the active local session.";
-    default:
-      return "Continuing in another pi session.";
-  }
 }

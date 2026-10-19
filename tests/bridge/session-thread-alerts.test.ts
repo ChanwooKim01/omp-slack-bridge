@@ -1,11 +1,15 @@
 /**
  * Alerts from parallel sessions must not pile up in the channel: each session gets
  * one top-level root, and every later alert of that session is a reply in its thread.
+ * A reply in a session's thread belongs to that session only: when it is not running,
+ * the user is told so and the reply never becomes another session's prompt.
  */
 
 import { afterEach, expect, it, vi } from 'vitest';
 import type { ExtensionContext, ToolDefinition } from '@earendil-works/pi-coding-agent';
 import { type BridgeHarness, createBridgeHarness } from '../helpers/bridge-harness';
+
+const OFFLINE_NOTICE = '이 스레드의 세션이 꺼져 있습니다. Paseo에서 해당 에이전트를 열면 다시 연결됩니다.';
 
 let h: BridgeHarness;
 
@@ -29,6 +33,7 @@ it('concurrent alerts share one session root, and a new session opens its own ro
     cmdIdle: true,
     agentIdle: true,
     autoConnect: true,
+    joinedSessions: ['/tmp/session-a', '/tmp/session-b'],
   });
   await h.sessionStart();
   h.sendCalls.length = 0;
@@ -40,12 +45,13 @@ it('concurrent alerts share one session root, and a new session opens its own ro
   const rootA = 'ts-1';
   expect(h.sendCalls.slice(1).map((call) => call.threadTs)).toEqual([rootA, rootA, rootA]);
 
-  h.state.sessionFile = '/tmp/session-b';
+  await h.switchSession('/tmp/session-b');
   await requestApproval('bash', 6);
   expect(h.sendCalls[4]).toMatchObject({ text: 'root /tmp/session-b', threadTs: undefined });
   expect(h.sendCalls[5]?.threadTs).toBe('ts-5');
 
-  // A channel reply in session A's thread while B is active must not become B's prompt, now or on retry.
+  // Session A is no longer running here. A channel reply in its thread while B is active must not
+  // become B's prompt, now or on retry.
   const replyInA = {
     chatId: 'C123', content: 'A 쪽 결과 알려줘', username: 'testuser', userId: 'U123', timestamp: new Date(),
     messageId: '900.000001', isGroupChat: true, wasMentioned: false, threadId: rootA, isThreadReply: true,
@@ -53,7 +59,10 @@ it('concurrent alerts share one session root, and a new session opens its own ro
   await h.invokeClientMessage(replyInA);
   await h.invokeClientMessage({ ...replyInA, messageId: '900.000002' });
   expect(h.sendUserMessages()).toHaveLength(0);
-  expect(h.sendCalls.slice(6).map((call) => call.threadTs)).toEqual([rootA, rootA]);
+  expect(h.sendCalls.slice(6).map((call) => [call.threadTs, call.text])).toEqual([
+    [rootA, OFFLINE_NOTICE],
+    [rootA, OFFLINE_NOTICE],
+  ]);
 });
 
 it('a late answer in an earlier session thread keeps that thread owned by the earlier session', async () => {
@@ -65,6 +74,7 @@ it('a late answer in an earlier session thread keeps that thread owned by the ea
     cmdIdle: true,
     agentIdle: true,
     autoConnect: true,
+    joinedSessions: ['/tmp/session-a', '/tmp/session-b'],
   });
   await h.sessionStart();
   h.sendCalls.length = 0;
@@ -80,15 +90,17 @@ it('a late answer in an earlier session thread keeps that thread owned by the ea
   local.resolve({ content: [], details: { results: [{ id: 'go', selectedOptions: ['진행'] }] } });
   await result;
 
-  h.state.sessionFile = '/tmp/session-b';
+  await h.switchSession('/tmp/session-b');
   const reply = {
     chatId: 'C123', username: 'testuser', userId: 'U123', timestamp: new Date(),
     isGroupChat: true, wasMentioned: false, threadId: 'ts-1', isThreadReply: true,
   };
   await h.invokeClientMessage({ ...reply, content: '1', messageId: '900.000001' });
   await vi.waitFor(() => expect(h.sendCalls).toHaveLength(3));
-  expect(h.sendCalls[2]?.text).toContain('이미 종료된 질문');
+  expect(h.sendCalls[2]?.text).toBe(OFFLINE_NOTICE);
   await h.invokeClientMessage({ ...reply, content: 'A 쪽 결과 알려줘', messageId: '900.000002' });
   expect(h.sendUserMessages()).toHaveLength(0);
-  expect(h.sendCalls[3]?.text).toContain('이전 세션의 스레드');
+  expect(h.sendCalls[3]?.text).toBe(OFFLINE_NOTICE);
+  // The notices never remapped the thread to the active session.
+  expect(h.config.slackRouting.threadsByKey['C123:ts-1'].sessionPath).toBe('/tmp/session-a');
 });

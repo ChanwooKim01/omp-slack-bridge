@@ -3,31 +3,34 @@
  * Bridges Slack into pi — a pure Slack remote control surface for the pi coding agent.
  *
  * Architecture:
- *   bridge/index.ts   — Extension lifecycle wiring (session hooks, message routing, command registration)
- *   slack/client.ts   — Slack API client (connect, send, receive, reactions, file upload)
- *   slack/routing.ts  — Thread-to-session mapping state
+ *   bridge/index.ts   — Extension lifecycle wiring (session membership, router election, message routing, command registration)
+ *   slack/client.ts   — Slack API client (Socket Mode receiving for the router; Web API posting, reactions and uploads for every joined session)
+ *   slack/routing.ts  — Thread-to-session mapping state and the inbound routing decision
  *   slack/blocks.ts   — Markdown → Slack Block Kit conversion
  *   slack/formatting.ts — Message splitting, truncation, tool call formatting
- *   session/lock.ts   — Single-instance connection guard (global flag + PID lock file)
+ *   session/lock.ts   — Router lock (global flag + PID lock file): its owner holds the one Slack socket
+ *   session/registry.ts — Registry of joined sessions (one file per session, liveness = PID alive)
+ *   session/inbox.ts  — Per-session inbox the router uses to hand messages to another session's process
  *   session/tmux.ts   — Tmux session spawning for fresh bridge sessions
  *   session/handlers.ts — Session-level helpers (conversation history, footer text, session listing)
  *   session/replay.ts   — Message replay engine for session handoff
  *   auth/challenge.ts — Challenge-based user authentication
- *   config/index.ts   — File + env var config loading/saving
+ *   config/index.ts   — Config loading and cross-process-safe updates (env vars override the file)
+ *   util/atomic-write.ts — Atomic file replacement and synchronous sleep
  *   types/index.ts    — Shared type definitions
  *   bridge/commands.ts — Shared command definitions (status text, help text, remote command list)
  *   ui/main-menu.ts   — Interactive TUI main menu
  *   ui/status-widget.ts — Status widget
  */
 
+import { setTimeout as sleep } from "node:timers/promises";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import * as fs from "fs";
-import * as os from "os";
 import * as path from "path";
 import { Type } from "typebox";
 import { ChallengeAuth } from "../auth/challenge.js";
-import { loadConfig, saveConfig } from "../config/index.js";
+import { loadConfig, updateConfig } from "../config/index.js";
 import {
   buildSessionListText,
   buildSlackFooterText,
@@ -36,14 +39,17 @@ import {
   getLastAssistantMessageInfo,
   listRecentSessions,
 } from "../session/handlers.js";
+import { clearInbox, drainInbox, enqueueInboxMessage } from "../session/inbox.js";
 import {
   acquireLock,
   forceAcquireLock,
   getInstanceId,
+  getLockOwner,
   isCurrentLockOwner,
   isLockHeldLocally,
   releaseLock,
 } from "../session/lock.js";
+import { ensureRegistered, isSessionLive, registerSession, unregisterSession } from "../session/registry.js";
 import { buildTmuxConnectSummary, resolvePathInput, runTmuxPiConnect } from "../session/tmux.js";
 import { SlackClient } from "../slack/client.js";
 import {
@@ -51,30 +57,72 @@ import {
   formatToolCalls,
 } from "../slack/formatting.js";
 import {
+  decideInboundRoute,
   getRememberedSlackThreadForCurrentSession,
   getSlackThreadOwnerSession,
   hasLatestAssistantBeenDeliveredToSlackThread,
+  isExplicitRemoteResumeCommand,
   markLatestAssistantDeliveredToSlackThread,
   rememberSlackThreadForSession,
+  SESSION_OFFLINE_NOTICE,
 } from "../slack/routing.js";
 import type { ExternalMessage, PendingRemoteChat } from "../types/index.js";
 import { openMainMenu } from "../ui/main-menu.js";
 import { createStatusWidget } from "../ui/status-widget.js";
 import {
+  type BridgeStatus,
   buildBridgeHelpText,
   buildBridgeStatusText,
   buildRemoteCommandList,
-  getSlackHandoverReasonText,
 } from "./commands.js";
 import { installPaseoQuestions } from "./paseo-questions.js";
+
+/** Cadence of the three checks every joined session runs. */
+const OWNERSHIP_CHECK_MS = 250;
+const ELECTION_CHECK_MS = 2_000;
+const INBOX_POLL_MS = 500;
+/** How long a forced router takeover waits for the previous router to close its socket. */
+const TAKEOVER_SETTLE_MS = 350;
+/** Per-step cap while leaving the bridge: hosts give session_shutdown handlers about two seconds. */
+const SHUTDOWN_STEP_BUDGET_MS = 1_500;
+const MAX_CLAIM_BACKOFF_MS = 60_000;
+const NOTICE_REPEAT_MS = 60_000;
+/** Inbox messages remembered for de-duplication by chat:ts. */
+const SEEN_INBOX_LIMIT = 4096;
+
+/** Wait for `work`, but never longer than `ms`; a failure of `work` is ignored. */
+async function settleWithin(work: Promise<unknown>, ms: number): Promise<void> {
+  const cancelTimeout = new AbortController();
+  await Promise.race([
+    work.catch(() => undefined),
+    sleep(ms, undefined, { signal: cancelTimeout.signal }).catch(() => undefined),
+  ]);
+  cancelTimeout.abort();
+}
 
 export default function (pi: ExtensionAPI): void {
   let slackClient: SlackClient | null = null;
   let pendingRemoteChat: PendingRemoteChat | null = null;
   let auth: ChallengeAuth;
   let ctx: ExtensionContext;
-  let ownershipTimer: NodeJS.Timeout | undefined;
+  /** Session file this runtime joined to the bridge; undefined while the session is not part of it. */
+  let joinedSessionPath: string | undefined;
+  let membershipTimers: NodeJS.Timeout[] = [];
+  let membershipChange: Promise<void> = Promise.resolve();
+  /** Bumped on every join and leave, so work accepted under an earlier membership can tell it is stale. */
+  let membershipGeneration = 0;
+  let membershipStopping = false;
+  /**
+   * This runtime acquired the router lock and has not released it. Tracked per runtime because the
+   * lock flag is process-wide: a sibling extension instance in the same process must not release it.
+   */
+  let routerLockHeld = false;
+  let routerClaim: Promise<boolean> | null = null;
+  let claimBackoff = { notBefore: 0, delayMs: 0 };
   let ownershipCheckInProgress = false;
+  let inboxQueue: Promise<void> = Promise.resolve();
+  const seenInboxMessages = new Set<string>();
+  const lastNoticeAt = new Map<string, number>();
   const sessionRootPosts = new Map<string, Promise<string | undefined>>();
   let activeSlackReaction: { chatId: string; messageId: string } | null = null;
   let turnAccumulator: {
@@ -87,10 +135,9 @@ export default function (pi: ExtensionAPI): void {
     resolve: () => void;
     reject: (err: Error) => void;
   } | null = null;
-  const handoffDir = path.join(os.homedir(), ".omp", "agent", "slk-bridge-handoffs");
   const questions = installPaseoQuestions(pi, async (text, target) => {
-    if (!ownsBridgeConnection() || !slackIsConnected()) return undefined;
-    const chatId = target?.chatId ?? auth.getNotificationChatId();
+    if (!canPost()) return undefined;
+    const chatId = target?.chatId ?? notificationChatId();
     if (!chatId) return undefined;
     // Pin the session at alert time so a session switch mid-post cannot remap this thread.
     // Replies into an existing question thread keep that thread's owner, which may be an earlier session.
@@ -133,9 +180,14 @@ export default function (pi: ExtensionAPI): void {
   // ── Short-lived helpers (bridge state accessors) ──────────────────────────
 
   function getCurrentSessionFile(): string | undefined {
-    return ctx.sessionManager.getSessionFile();
+    try {
+      return ctx.sessionManager.getSessionFile();
+    } catch {
+      return undefined; // the session context is gone or not yet bound
+    }
   }
 
+  /** This process holds the router lock, so it alone may hold the Slack socket and receive from Slack. */
   function ownsBridgeConnection(): boolean {
     return isLockHeldLocally() && isCurrentLockOwner();
   }
@@ -144,12 +196,109 @@ export default function (pi: ExtensionAPI): void {
     return slackClient !== null;
   }
 
+  /** The Slack socket is open. Only the router's is. */
   function slackIsConnected(): boolean {
     return slackClient?.isConnected ?? false;
   }
 
+  function isJoined(): boolean {
+    return joinedSessionPath !== undefined;
+  }
+
+  /** One join of one session. Work accepted under it is void once that session leaves or the process switches sessions. */
+  interface Membership {
+    sessionPath: string;
+    generation: number;
+  }
+
+  /** The membership in force right now; none while the session has not joined or is on its way out. */
+  function currentMembership(): Membership | undefined {
+    if (joinedSessionPath === undefined || membershipStopping) return undefined;
+    return { sessionPath: joinedSessionPath, generation: membershipGeneration };
+  }
+
+  function isCurrentMembership(membership: Membership): boolean {
+    return !membershipStopping && joinedSessionPath === membership.sessionPath && membershipGeneration === membership.generation;
+  }
+
+  /** The session joined the bridge and has a Slack client: it may post, react and upload without owning the socket. */
+  function canPost(): boolean {
+    return slackClient !== null && joinedSessionPath !== undefined;
+  }
+
+  /** This process is the router: it owns the lock and has the Slack socket open. */
+  function isRouter(): boolean {
+    return ownsBridgeConnection() && slackIsConnected();
+  }
+
+  /**
+   * Chat id of the paired DM. The config file is authoritative: another process may have paired or
+   * revoked since this one started. In-memory auth is only the fallback when nothing is stored.
+   */
+  function notificationChatId(): string | undefined {
+    const stored = loadConfig().auth;
+    if (!stored) return auth.getNotificationChatId();
+    const trusted = stored.trustedUser?.split(":")[0];
+    return trusted ? stored.userChats?.[trusted] : undefined;
+  }
+
   function getSlackClient(): SlackClient | null {
     return slackClient;
+  }
+
+  /** Flip tool-call visibility in remote messages and describe the new state. */
+  function toggleToolCalls(): string {
+    const cfg = updateConfig((config) => {
+      config.hideToolCalls = !config.hideToolCalls;
+    });
+    return `🔧 Tool calls ${cfg.hideToolCalls ? "hidden" : "shown"} in remote messages`;
+  }
+
+  /** Flip whether joined sessions auto-claim the router role, and describe the new state. */
+  function toggleAutoConnect(): string {
+    const cfg = updateConfig((config) => {
+      config.autoConnect = config.autoConnect === false;
+    });
+    return `🔌 Auto-claim of the router role ${cfg.autoConnect !== false ? "on" : "off"}`;
+  }
+
+  /** Add or remove a session from the list that never auto-claims the router role. False when nothing changed. */
+  function setOptedOut(sessionFile: string, optedOut: boolean): boolean {
+    let changed = false;
+    updateConfig((config) => {
+      const current = config.optedOutSessions ?? [];
+      if (current.includes(sessionFile) === optedOut) return;
+      changed = true;
+      const next = optedOut ? [...current, sessionFile] : current.filter((entry) => entry !== sessionFile);
+      config.optedOutSessions = next.length > 0 ? next : undefined;
+    });
+    return changed;
+  }
+
+  function setSessionOptOut(
+    ui: { notify(message: string, type: "info" | "warning" | "error"): void },
+    optedOut: boolean,
+  ): void {
+    const sessionFile = getCurrentSessionFile();
+    if (!sessionFile) {
+      ui.notify("❌ No session file available for this session", "error");
+      return;
+    }
+    if (!setOptedOut(sessionFile, optedOut)) {
+      ui.notify(
+        optedOut
+          ? "ℹ️ This session is already opted out of auto-claiming the router role"
+          : "ℹ️ This session was not opted out — nothing to do",
+        "info",
+      );
+      return;
+    }
+    ui.notify(
+      optedOut
+        ? "🛑 This session will NOT auto-claim the Slack router role"
+        : "✅ This session can auto-claim the Slack router role again",
+      "info",
+    );
   }
 
   function toPendingRemoteChat(message: ExternalMessage): PendingRemoteChat {
@@ -174,14 +323,6 @@ export default function (pi: ExtensionAPI): void {
   /** Resolve a thread ID: prefer explicit, fall back to remembered */
   function resolveThreadId(chatId: string, explicitThreadId?: string): string | undefined {
     return explicitThreadId || getRememberedSlackThreadForCurrentSession(chatId, getCurrentSessionFile);
-  }
-
-  // ── Handoff directory ────────────────────────────────────────────────────
-
-  function ensureHandoffDir(): void {
-    if (!fs.existsSync(handoffDir)) {
-      fs.mkdirSync(handoffDir, { recursive: true, mode: 0o700 });
-    }
   }
 
   // ── Slack reaction helpers ───────────────────────────────────────────────
@@ -244,7 +385,7 @@ export default function (pi: ExtensionAPI): void {
     },
   ): Promise<string | undefined> {
     const slack = getSlackClient();
-    if (!slack) return undefined;
+    if (!slack || !canPost()) return undefined;
 
     const threadTs = options?.forceTopLevel
       ? undefined
@@ -268,7 +409,7 @@ export default function (pi: ExtensionAPI): void {
     options?: { title?: string; initialComment?: string },
     remoteChat: PendingRemoteChat | null = pendingRemoteChat,
   ): Promise<string> {
-    if (!remoteChat || !ownsBridgeConnection()) {
+    if (!remoteChat || !canPost()) {
       throw new Error("No active remote chat is available for file upload");
     }
 
@@ -341,136 +482,357 @@ export default function (pi: ExtensionAPI): void {
     );
   }
 
-  async function notifySlackSessionHandover(reason?: "user-request" | "active-session"): Promise<void> {
-    const chatId = auth.getNotificationChatId();
-    if (!chatId) return;
+  // ── Bridge membership: join, leave, router election ──────────────────────
+  //
+  // Every Slack event reaches exactly one open socket, so exactly one process — the router, the
+  // owner of the lock file — holds it. Every joined session can post to Slack with the bot token
+  // alone. Replies the router receives for another live session's thread travel through that
+  // session's inbox; there is no LLM relay anywhere on this path.
 
-    const handoverMessage = [
-      "🔄 Session changed",
-      getSlackHandoverReasonText(reason),
-    ].join("\n");
+  type RouterRole = "this-session" | "other-session" | "none";
 
-    // Fire the full conversation replay as a background task so connectCurrentSession
-    // returns quickly — pi can process the user's input without waiting for 50 Slack API calls.
-    const conversation = getConversationHistory(ctx.sessionManager);
-    void (async () => {
-      try {
-        const threadTs = await sendToRemoteChat(chatId, handoverMessage, {
-          forceTopLevel: true,
-        });
-
-        for (const entry of conversation) {
-          const text = entry.role === "user"
-            ? `🗣️ **User:** ${entry.text}`
-            : entry.text;
-          await sendToRemoteChat(chatId, text, { threadId: threadTs });
-        }
-
-        if (threadTs && conversation.length > 0) {
-          markLatestAssistantDeliveredToSlackThread(
-            chatId,
-            threadTs,
-            undefined,
-            getCurrentSessionFile,
-            () => getLastAssistantMessageInfo(ctx.sessionManager),
-          );
-        }
-      } catch {
-        // Ignore notification failures
-      }
-    })();
+  interface JoinResult {
+    /** Who holds the Slack socket once joining finished. */
+    router: RouterRole;
+    /** Why this session could not claim the router role, when it tried and failed. */
+    error?: string;
   }
 
-  // ── Connect / disconnect ─────────────────────────────────────────────────
+  /** Report from a background path without ever throwing: the host context may already be torn down. */
+  function notify(message: string, level: "info" | "warning" | "error" = "info"): void {
+    try {
+      ctx.ui.notify(message, level);
+    } catch {
+      // The session context is gone.
+    }
+  }
+
+  /** Like `notify`, but a failure that repeats on every tick is shown at most once a minute. */
+  function notifyRepeating(key: string, message: string, level: "info" | "warning" | "error"): void {
+    const now = Date.now();
+    if ((lastNoticeAt.get(key) ?? 0) + NOTICE_REPEAT_MS > now) return;
+    lastNoticeAt.set(key, now);
+    notify(message, level);
+  }
+
+  /** Run a detached task whose failure must be reported rather than thrown: a stray rejection would take the host session down. */
+  function runInBackground(task: () => Promise<void>): void {
+    void task().catch((err: Error) => {
+      notifyRepeating(`background:${err.message}`, `❌ slk-bridge background task failed: ${err.message}`, "error");
+    });
+  }
+
+  function safeInterval(task: () => void | Promise<void>, ms: number): NodeJS.Timeout {
+    const timer = setInterval(() => runInBackground(async () => task()), ms);
+    timer.unref?.();
+    return timer;
+  }
+
+  function routerRole(): RouterRole {
+    const owner = getLockOwner();
+    if (!owner) return "none";
+    return owner.pid === process.pid && owner.owner === getInstanceId() ? "this-session" : "other-session";
+  }
+
+  function bridgeStatus(): BridgeStatus {
+    const stats = auth.getStats();
+    return {
+      joined: isJoined(),
+      router: routerRole(),
+      socketOpen: slackIsConnected(),
+      autoConnect: loadConfig().autoConnect !== false,
+      trustedUser: stats.trustedUser,
+      channels: stats.channels,
+    };
+  }
+
+  function describeJoin(result: JoinResult): string {
+    switch (result.router) {
+      case "this-session":
+        return "✅ Joined the Slack bridge. This session is the router.";
+      case "other-session":
+        return "✅ Joined the Slack bridge. Another session is the router.";
+      case "none":
+        return `⚠️ Joined the Slack bridge, but no session holds the Slack socket${
+          result.error ? `: ${result.error}` : ". Run /slk-bridge router, or turn on /slk-bridge autoconnect."
+        }`;
+    }
+  }
+
+  /** One membership change at a time: join, leave and session switches never interleave. */
+  function enqueueMembershipChange<T>(task: () => Promise<T>): Promise<T> {
+    const run = membershipChange.then(task);
+    membershipChange = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  function clearMembershipTimers(): void {
+    for (const timer of membershipTimers) clearInterval(timer);
+    membershipTimers = [];
+  }
+
+  /** Register the session and start the three periodic checks: lock ownership, router election, inbox. */
+  function startMembership(sessionPath: string): void {
+    registerSession(sessionPath);
+    joinedSessionPath = sessionPath;
+    membershipGeneration++;
+    clearMembershipTimers();
+    membershipTimers = [
+      safeInterval(enforceLockOwnership, OWNERSHIP_CHECK_MS),
+      safeInterval(electionTick, ELECTION_CHECK_MS),
+      safeInterval(pollInbox, INBOX_POLL_MS),
+    ];
+    updateWidget();
+  }
+
+  function dropRouterLock(): void {
+    if (!routerLockHeld) return;
+    routerLockHeld = false;
+    releaseLock();
+  }
+
+  /** Close the Slack socket and release the router lock. Time-capped so a shutdown stays inside the host's budget. */
+  async function relinquishRouter(): Promise<void> {
+    if (slackClient) await settleWithin(slackClient.disconnect(), SHUTDOWN_STEP_BUDGET_MS);
+    dropRouterLock();
+  }
 
   /**
-   * Connect Slack bridge without sending any handover notification.
-   * Ensures Slack client is connected and lock is held.
+   * Take this session out of the bridge: stop its checks, unregister it so the router stops handing
+   * it messages, and give up the router role if held. The persisted join stays, so a restarted
+   * process for the same session rejoins; `leaveCurrentSession` is the call that forgets it.
    */
-  async function connectSlackBridge(): Promise<void> {
-    if (!hasConfiguredSlack()) {
-      throw new Error("Slack not configured");
-    }
-    if (slackIsConnected()) return;
-
-    if (!acquireLock()) {
-      throw new Error("Another session holds the bridge lock");
-    }
-
+  async function stopMembership(): Promise<void> {
+    membershipGeneration++; // work queued for the membership that is ending must not run
+    membershipStopping = true;
     try {
-      if (slackClient) {
-        await slackClient.connect();
-      }
+      clearMembershipTimers();
+      if (joinedSessionPath) unregisterSession(joinedSessionPath);
+      await Promise.all([
+        relinquishRouter(),
+        settleWithin(clearSlackWorkingReaction(), SHUTDOWN_STEP_BUDGET_MS),
+      ]);
+      joinedSessionPath = undefined;
+      pendingRemoteChat = null;
+      turnAccumulator = null;
       updateWidget();
-    } catch (err) {
-      releaseLock();
-      updateWidget();
-      throw err;
+    } finally {
+      membershipStopping = false;
     }
   }
 
-  async function connectCurrentSession(options?: {
-    respectAutoConnect?: boolean;
-    showTakeoverNotice?: boolean;
-    notifySlackHandover?: boolean;
-    handoverReason?: "user-request" | "active-session";
-  }): Promise<boolean> {
-
-    const config = loadConfig();
-    if ((options?.respectAutoConnect ?? false) && config.autoConnect === false) {
-      return false;
-    }
-    if (!hasConfiguredSlack()) {
-      return false;
-    }
-
-    const alreadyOwner = ownsBridgeConnection();
-    const previousOwner = alreadyOwner ? null : forceAcquireLock();
-    const tookOver = !!previousOwner && (previousOwner.pid !== process.pid || previousOwner.owner !== getInstanceId());
-
-    if (options?.showTakeoverNotice && tookOver) {
-      ctx.ui.notify("🔄 Taking over slk-bridge connection from another session...", "info");
-    }
-
-    if (alreadyOwner && slackIsConnected()) {
-      return false;
-    }
-
-    if (tookOver) {
-      await new Promise((resolve) => setTimeout(resolve, 350));
-    }
-
-    try {
-      await connectSlackBridge();
-      if (tookOver && options?.notifySlackHandover !== false) {
-        await notifySlackSessionHandover(options?.handoverReason);
+  /** Make the membership match the session this process hosts now (session start, switch, branch). */
+  function reconcileMembership(): Promise<void> {
+    return enqueueMembershipChange(async () => {
+      const current = getCurrentSessionFile();
+      if (current === joinedSessionPath) return;
+      if (joinedSessionPath) await stopMembership();
+      if (!slackClient || !current) return;
+      if (loadConfig().joinedSessions?.includes(current)) {
+        startMembership(current);
+        runInBackground(electionTick);
       }
-      return tookOver;
-    } catch (err) {
-      if (!alreadyOwner) {
-        releaseLock();
+    }).catch((err: Error) => {
+      notify(`❌ slk-bridge could not update its bridge membership: ${err.message}`, "error");
+    });
+  }
+
+  /**
+   * Join this session to the bridge: register it, remember the join so a restarted process rejoins,
+   * post (or reuse) its root thread in the paired DM, and claim the router role. A live router is
+   * never displaced unless `claim` is "force".
+   */
+  function joinCurrentSession(options: { postRoot: boolean; claim: "vacant" | "force" }): Promise<JoinResult> {
+    return enqueueMembershipChange(async () => {
+      if (!slackClient) throw new Error("Slack not configured. Run /slk-bridge configure first");
+      const sessionPath = getCurrentSessionFile();
+      if (!sessionPath) throw new Error("This session has no session file yet. Send a message first, then connect.");
+
+      updateConfig((cfg) => {
+        if (!cfg.joinedSessions?.includes(sessionPath)) cfg.joinedSessions = [...(cfg.joinedSessions ?? []), sessionPath];
+      });
+      if (joinedSessionPath === sessionPath) {
+        registerSession(sessionPath);
+      } else {
+        if (joinedSessionPath) await stopMembership();
+        startMembership(sessionPath);
+      }
+
+      if (options.postRoot) {
+        const chatId = notificationChatId();
+        if (chatId) await ensureSessionThread(chatId, sessionPath);
+      }
+
+      let error: string | undefined;
+      try {
+        await claimRouter({ force: options.claim === "force" });
+      } catch (err) {
+        error = (err as Error).message;
       }
       updateWidget();
-      throw err;
+      return { router: routerRole(), ...(error ? { error } : {}) };
+    });
+  }
+
+  /** Leave the bridge for good: unlike a shutdown, this forgets the persisted join and drops pending messages. */
+  function leaveCurrentSession(): Promise<void> {
+    return enqueueMembershipChange(async () => {
+      const sessionPath = joinedSessionPath ?? getCurrentSessionFile();
+      if (sessionPath) {
+        updateConfig((cfg) => {
+          const remaining = (cfg.joinedSessions ?? []).filter((entry) => entry !== sessionPath);
+          cfg.joinedSessions = remaining.length > 0 ? remaining : undefined;
+        });
+      }
+      await stopMembership();
+      if (sessionPath) clearInbox(sessionPath);
+    });
+  }
+
+  // ── Router role ──────────────────────────────────────────────────────────
+
+  /**
+   * Take the router role: hold the lock, then open the Slack socket. `force` overwrites a live
+   * router's lock (the old router notices and closes its socket); otherwise a live router is respected.
+   * Resolves true when this session is the router afterwards.
+   */
+  async function claimRouter(options: { force: boolean }): Promise<boolean> {
+    while (routerClaim) await routerClaim.catch(() => undefined); // one claim at a time
+    const claim = doClaimRouter(options);
+    routerClaim = claim;
+    try {
+      return await claim;
+    } finally {
+      if (routerClaim === claim) routerClaim = null;
     }
   }
 
-  async function disconnectCurrentSession(): Promise<void> {
-    if (slackClient) {
-      await slackClient.disconnect();
+  async function doClaimRouter(options: { force: boolean }): Promise<boolean> {
+    const client = slackClient;
+    const sessionPath = joinedSessionPath;
+    if (!client || !sessionPath) return false;
+    if (routerLockHeld && ownsBridgeConnection() && client.isConnected) return true;
+
+    let tookOver = false;
+    if (options.force) {
+      const previous = forceAcquireLock();
+      tookOver = !!previous && (previous.pid !== process.pid || previous.owner !== getInstanceId());
+    } else if (!acquireLock()) {
+      return false;
     }
-    releaseLock();
-    const cfg = loadConfig();
-    cfg.autoConnect = false;
-    saveConfig(cfg);
+    routerLockHeld = true;
+    // The old router closes its socket within one ownership check of losing the lock.
+    if (tookOver) await sleep(TAKEOVER_SETTLE_MS);
+
+    try {
+      // Trust may have changed in the previous router since this process started.
+      const stored = loadConfig().auth;
+      if (stored) auth.loadFromConfig(stored);
+      await client.connect();
+    } catch (err) {
+      await client.disconnect().catch(() => undefined);
+      dropRouterLock();
+      updateWidget();
+      throw err;
+    }
+
+    // Left the bridge, or moved to another client or session, while connecting: undo.
+    if (joinedSessionPath !== sessionPath || slackClient !== client) {
+      await client.disconnect().catch(() => undefined);
+      dropRouterLock();
+      return false;
+    }
     updateWidget();
+    return true;
+  }
+
+  /** Joined sessions may claim a vacant router role on their own unless `autoConnect` is off or the session opted out. */
+  function autoClaimAllowed(sessionPath: string): boolean {
+    const config = loadConfig();
+    return config.autoConnect !== false && !config.optedOutSessions?.includes(sessionPath);
+  }
+
+  /**
+   * Every joined session runs this every couple of seconds: it notices a session switch no event
+   * announced, keeps its registration alive, and claims the router role when no live process holds it.
+   */
+  async function electionTick(): Promise<void> {
+    const sessionPath = joinedSessionPath;
+    if (!sessionPath || !slackClient) return;
+    const current = getCurrentSessionFile();
+    if (current && current !== sessionPath) {
+      await reconcileMembership();
+      return;
+    }
+    ensureRegistered(sessionPath);
+
+    if (routerClaim || isRouter()) return;
+    const owner = getLockOwner();
+    if (owner && !(owner.pid === process.pid && owner.owner === getInstanceId())) return; // a live router exists
+    if (Date.now() < claimBackoff.notBefore || !autoClaimAllowed(sessionPath)) return;
+
+    try {
+      await claimRouter({ force: false });
+      claimBackoff = { notBefore: 0, delayMs: 0 };
+    } catch (err) {
+      // Back off so a bad token or a dead network is not retried on every tick.
+      const delayMs = Math.min(claimBackoff.delayMs ? claimBackoff.delayMs * 2 : ELECTION_CHECK_MS, MAX_CLAIM_BACKOFF_MS);
+      claimBackoff = { notBefore: Date.now() + delayMs, delayMs };
+      notifyRepeating("router-claim", `⚠️ Slack connection failed: ${(err as Error).message}`, "warning");
+    }
+  }
+
+  /**
+   * Close the Slack socket whenever this process no longer provably owns the router lock — taken
+   * over by `/slk-bridge router`, or the local flag was cleared while the socket stayed open. Keying
+   * on the socket as well as the flag is what stops a stray connection from outliving the lock.
+   */
+  async function enforceLockOwnership(): Promise<void> {
+    const client = slackClient;
+    if (!client || ownershipCheckInProgress) return;
+    if (routerLockHeld && isLockHeldLocally() && isCurrentLockOwner()) return;
+    if (!routerLockHeld && !client.isConnected) return;
+
+    ownershipCheckInProgress = true;
+    try {
+      await client.disconnect();
+      dropRouterLock();
+      updateWidget();
+      notify("🔄 slk-bridge router role moved to another session", "info");
+    } finally {
+      ownershipCheckInProgress = false;
+    }
+  }
+
+  // ── Inbox ────────────────────────────────────────────────────────────────
+
+  /** Hand every message the router queued for this session to the normal message path, oldest first and once each. */
+  function pollInbox(): void {
+    const membership = currentMembership();
+    if (!membership) return;
+    for (const message of drainInbox(membership.sessionPath)) {
+      const key = `${message.chatId}:${message.messageId}`;
+      if (seenInboxMessages.has(key)) continue;
+      seenInboxMessages.add(key);
+      if (seenInboxMessages.size > SEEN_INBOX_LIMIT) {
+        const oldest = seenInboxMessages.values().next().value;
+        if (oldest) seenInboxMessages.delete(oldest);
+      }
+      // The job keeps the membership it was read under, so leaving or switching sessions voids it
+      // even though it is already queued (the queue itself cannot be emptied).
+      inboxQueue = inboxQueue
+        .then(() => handleIncomingRemoteMessage(message, { membership }))
+        .catch((err: Error) => {
+          notify(`❌ Failed to handle Slack message: ${err.message}`, "error");
+        });
+    }
   }
 
   async function startFreshBridgeSession(cwdArg?: string): Promise<string> {
     const cwd = resolvePathInput(cwdArg?.trim() ? cwdArg : ctx.cwd, ctx.cwd);
     const result = await runTmuxPiConnect({
       cwd,
-      bridgeCommand: "/slk-bridge connect user-request",
+      bridgeCommand: "/slk-bridge connect",
     });
     return buildTmuxConnectSummary(result);
   }
@@ -486,22 +848,17 @@ export default function (pi: ExtensionAPI): void {
     const result = await runTmuxPiConnect({
       cwd,
       piArgs: ["--session", selected.path],
-      bridgeCommand: "/slk-bridge connect user-request",
+      bridgeCommand: "/slk-bridge connect",
     });
     return buildTmuxConnectSummary(result);
   }
 
   // ── Message handling ─────────────────────────────────────────────────────
 
-  function isExplicitRemoteResumeCommand(message: ExternalMessage): boolean {
-    return /^\.bridge\s+resume(?:\s|$)/i.test(message.content.trim());
-  }
-
   async function forwardRemoteCommandToPi(message: ExternalMessage, text: string): Promise<void> {
     pendingRemoteChat = toPendingRemoteChat(message);
-    const explicitResumeCommand = isExplicitRemoteResumeCommand(message);
 
-    if (message.threadId && !explicitResumeCommand) {
+    if (message.threadId && !isExplicitRemoteResumeCommand(message.content)) {
       rememberSlackThreadForSession(message.chatId, message.threadId, undefined, getCurrentSessionFile);
     }
     if (ctx.isIdle()) {
@@ -511,102 +868,74 @@ export default function (pi: ExtensionAPI): void {
     }
   }
 
-  async function handoffSlackThreadToSession(message: ExternalMessage, targetSessionPath: string): Promise<void> {
-    const sessions = await listRecentSessions();
-    const targetSession = sessions.find((session) => session.path === targetSessionPath);
-    if (!targetSession) {
-      throw new Error(`Mapped Slack thread session not found: ${targetSessionPath}`);
-    }
-
-    ensureHandoffDir();
-    const handoffFile = path.join(
-      handoffDir,
-      `handoff-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}.json`,
-    );
-
-    fs.writeFileSync(
-      handoffFile,
-      JSON.stringify({
-        message: {
-          ...message,
-          timestamp: message.timestamp.toISOString(),
-        },
-        replayLastAssistantMessage: true,
-      }),
-      { mode: 0o600 },
-    );
-
-    try {
-      await runTmuxPiConnect({
-        cwd: targetSession.cwd || ctx.cwd,
-        piArgs: ["--session", targetSessionPath],
-        bridgeCommand: `/slk-bridge accept-handoff ${handoffFile}`,
-        attachClient: false,
-        cleanupOtherSessions: false,
-      });
-    } catch (err) {
-      try {
-        fs.unlinkSync(handoffFile);
-      } catch {
-        // Ignore cleanup failures
+  /**
+   * Router entry point for every message that passed authorization. A thread reply belongs to the
+   * session that owns the thread: a live owner receives it through its inbox, a dead one gets a
+   * notice. Everything else (top-level, unmapped, this session's own threads, `.bridge resume`)
+   * is handled here.
+   */
+  async function routeIncomingSlackMessage(message: ExternalMessage): Promise<void> {
+    const route = decideInboundRoute(message, getCurrentSessionFile(), isSessionLive);
+    switch (route.kind) {
+      case "inbox":
+        enqueueInboxMessage(route.sessionPath, message);
+        return;
+      case "offline":
+        // The thread stays owned by its session; the notice is no reason to remap it to the router.
+        await sendToRemoteChat(message.chatId, SESSION_OFFLINE_NOTICE, {
+          threadId: message.threadId,
+          rememberThreadForSessionPath: route.sessionPath,
+          noFooter: true,
+        });
+        return;
+      case "local": {
+        // A router that is leaving the bridge must not feed its agent.
+        const membership = currentMembership();
+        if (membership) await handleIncomingRemoteMessage(message, { membership });
+        return;
       }
-      throw err;
     }
   }
 
-  async function maybeRouteSlackMessageToMappedSession(message: ExternalMessage): Promise<boolean> {
-    // Channels host one thread per session too, so a reply in another session's thread must not reach this agent.
-    if (!message.threadId) {
-      return false;
-    }
-
-    if (isExplicitRemoteResumeCommand(message)) {
-      return false;
-    }
-
-    const currentSessionPath = getCurrentSessionFile();
-    const mappedSessionPath = getSlackThreadOwnerSession(message.chatId, message.threadId);
-
-    if (message.isThreadReply && mappedSessionPath && mappedSessionPath !== currentSessionPath) {
-      // Keep the thread owned by its session; the notice is not a reason to remap it here.
-      await sendToRemoteChat(message.chatId, "이전 세션의 스레드입니다. Paseo에서 해당 대화를 열고 새 질문 알림에 답변하세요.", {
-        threadId: message.threadId,
-        rememberThreadForSessionPath: mappedSessionPath,
-      });
-      return true;
-    }
-
-    rememberSlackThreadForSession(message.chatId, message.threadId, undefined, getCurrentSessionFile);
-    return false;
-  }
-
+  /**
+   * Handle a Slack message addressed to this session, whether it arrived by socket or through the
+   * inbox. `membership` pins the join the message was accepted under: inbox jobs are queued ahead of
+   * time, and once the session has left or switched they are dropped instead of being fed to
+   * whatever this process hosts by then.
+   */
   async function handleIncomingRemoteMessage(
     message: ExternalMessage,
-    options?: {
-      allowSessionRouting?: boolean;
-      replayLastAssistantMessage?: boolean;
-    },
+    options?: { replayLastAssistantMessage?: boolean; membership?: Membership },
   ): Promise<void> {
+    const membership = options?.membership ?? currentMembership();
+    const isStale = () => !membership || !isCurrentMembership(membership);
+    if (isStale()) return;
     if (await questions.receive(message)) return;
-    if ((options?.allowSessionRouting ?? true) && await maybeRouteSlackMessageToMappedSession(message)) {
-      return;
-    }
+    if (isStale()) return;
 
-    const explicitResumeCommand = isExplicitRemoteResumeCommand(message);
-    if (message.threadId && !explicitResumeCommand) {
+    if (message.threadId && !isExplicitRemoteResumeCommand(message.content)) {
       rememberSlackThreadForSession(message.chatId, message.threadId, undefined, getCurrentSessionFile);
     }
 
     if (options?.replayLastAssistantMessage) {
       await replayAllAssistantMessagesToSlackThread(toPendingRemoteChat(message));
+      if (isStale()) return;
     }
 
     if (await handleRemoteCommand(message)) {
       return;
     }
+    if (isStale()) return;
 
-    pendingRemoteChat = toPendingRemoteChat(message);
-    await setSlackWorkingReaction(pendingRemoteChat);
+    const remoteChat = toPendingRemoteChat(message);
+    pendingRemoteChat = remoteChat;
+    await setSlackWorkingReaction(remoteChat);
+    if (isStale()) {
+      // Left while the reaction was being added: do not feed the agent, and take the reaction back.
+      if (pendingRemoteChat === remoteChat) pendingRemoteChat = null;
+      await clearSlackWorkingReaction();
+      return;
+    }
     const taggedMessage = `[📱 @${message.username} via Slack]: ${message.content}`;
     if (ctx.isIdle()) {
       pi.sendUserMessage(taggedMessage);
@@ -687,29 +1016,21 @@ export default function (pi: ExtensionAPI): void {
         case "help":
           await sendRemoteText(message, buildBridgeHelpText());
           return true;
-        case "status": {
-          const stats = auth.getStats();
-          await sendRemoteText(message, buildBridgeStatusText(
-            slackIsConnected(),
-            stats.trustedUser,
-            stats.channels,
-          ));
+        case "status":
+          await sendRemoteText(message, buildBridgeStatusText(bridgeStatus()));
           return true;
-        }
         case "connect":
           try {
-            const cfg = loadConfig();
-            cfg.autoConnect = true;
-            saveConfig(cfg);
-            await connectCurrentSession({ showTakeoverNotice: true, handoverReason: "user-request" });
-            await sendRemoteText(message, "✅ Connected to Slack");
+            const result = await joinCurrentSession({ postRoot: true, claim: "vacant" });
+            await sendRemoteText(message, describeJoin(result));
           } catch (err) {
             await sendRemoteText(message, `❌ Connection failed: ${(err as Error).message}`);
           }
           return true;
         case "disconnect":
-          await disconnectCurrentSession();
-          await sendRemoteText(message, "🔌 Disconnected from Slack");
+          // Answer first: once this session has left the bridge it stays silent.
+          await sendRemoteText(message, "🔌 Left the Slack bridge. Run /slk-bridge connect in this session to rejoin.");
+          await leaveCurrentSession();
           return true;
         case "new":
           try {
@@ -786,14 +1107,9 @@ export default function (pi: ExtensionAPI): void {
           );
           return true;
         }
-        case "toggletools": {
-          const cfg = loadConfig();
-          cfg.hideToolCalls = !cfg.hideToolCalls;
-          saveConfig(cfg);
-          const state = cfg.hideToolCalls ? "hidden" : "shown";
-          await sendRemoteText(message, `🔧 Tool calls ${state} in remote messages`);
+        case "toggletools":
+          await sendRemoteText(message, toggleToolCalls());
           return true;
-        }
         default:
           await sendRemoteText(message, `Unknown bridge command: ${subcommand}`);
           return true;
@@ -806,28 +1122,25 @@ export default function (pi: ExtensionAPI): void {
   // ── Widget ───────────────────────────────────────────────────────────────
 
   function updateWidget(): void {
-    const config = loadConfig();
+    try {
+      const config = loadConfig();
 
-    if (config.showWidget === false) {
-      ctx.ui.setStatus("slk-bridge-status", undefined);
-      return;
-    }
+      if (config.showWidget === false) {
+        ctx.ui.setStatus("slk-bridge-status", undefined);
+        return;
+      }
 
-    const statusText = createStatusWidget(
-      { connected: slackIsConnected() },
-      { slack: [] },
-    );
-    if (statusText) {
-      ctx.ui.setStatus("slk-bridge-status", statusText);
-    } else {
-      ctx.ui.setStatus("slk-bridge-status", undefined);
+      const statusText = createStatusWidget({ connected: isJoined(), router: isRouter() }, { slack: [] });
+      ctx.ui.setStatus("slk-bridge-status", statusText || undefined);
+    } catch {
+      // The session context may already be torn down.
     }
   }
 
   function saveAuthState(): void {
-    const config = loadConfig();
-    config.auth = auth.exportConfig();
-    saveConfig(config);
+    updateConfig((config) => {
+      config.auth = auth.exportConfig();
+    });
   }
 
   // ── Register tool ────────────────────────────────────────────────────────
@@ -862,36 +1175,58 @@ export default function (pi: ExtensionAPI): void {
     },
   });
 
-  // ── Wire Slack client message handler ────────────────────────────────────
+  // ── Slack client wiring ──────────────────────────────────────────────────
 
-  function setupSlackMessageHandler(): void {
-    if (!slackClient) return;
-    slackClient.onMessage((msg: ExternalMessage) => {
-      if (!ownsBridgeConnection()) return;
-
-      void handleIncomingRemoteMessage(msg).catch((err: Error) => {
-        ctx.ui.notify(`❌ Failed to handle Slack message: ${err.message}`, "error");
+  /**
+   * Inbound path of the router: whichever process holds the socket routes what it receives. There
+   * is deliberately no router-lock check here — a socket that is still open must not drop events
+   * while ownership is moving; the ownership timer closes it.
+   */
+  function wireSlackClient(client: SlackClient): void {
+    client.onMessage((msg: ExternalMessage) => {
+      void routeIncomingSlackMessage(msg).catch((err: Error) => {
+        notify(`❌ Failed to handle Slack message: ${err.message}`, "error");
       });
     });
 
-    slackClient.onError((err: Error) => {
-      ctx.ui.notify(`❌ Slack error: ${err.message}`, "error");
+    client.onError((err: Error) => {
+      notify(`❌ Slack error: ${err.message}`, "error");
     });
+  }
+
+  /** Disconnect the previous client before a new one takes its place so no socket is orphaned. */
+  async function replaceSlackClient(next: SlackClient | null): Promise<void> {
+    const previous = slackClient;
+    slackClient = next;
+    if (next) wireSlackClient(next);
+    if (previous) await previous.disconnect().catch(() => undefined);
+  }
+
+  /** Rebuild the Slack client from `slack` (or the stored config) and join this session. */
+  async function reconnectSlack(slack?: { botToken: string; appToken: string }): Promise<JoinResult> {
+    const tokens = slack ?? loadConfig().slack;
+    if (!tokens?.botToken || !tokens.appToken) {
+      throw new Error("Slack not configured. Run /slk-bridge configure first");
+    }
+    await replaceSlackClient(new SlackClient(tokens, auth));
+    return joinCurrentSession({ postRoot: true, claim: "vacant" });
   }
 
   // ── pi lifecycle hooks ───────────────────────────────────────────────────
 
   pi.on("session_start", async (_event, context) => {
     ctx = context;
+    // A re-fired start must not leave the previous membership (timers, registration, socket) behind.
+    await stopMembership();
 
     const config = loadConfig();
 
     auth = new ChallengeAuth(
       (code, username) => {
-        ctx.ui.notify(`🔐 Challenge code for @${username}: ${code}`, "info");
+        notify(`🔐 Challenge code for @${username}: ${code}`, "info");
       },
       (message, level) => {
-        ctx.ui.notify(message, level);
+        notify(message, level);
       },
       async (_chatId, _message) => {
         // Challenge notifications are sent via the Slack client's sendMessage
@@ -903,112 +1238,53 @@ export default function (pi: ExtensionAPI): void {
       auth.loadFromConfig(config.auth);
     }
 
-    // Initialize Slack client in the background (non-blocking)
-    if (config.slack?.botToken && config.slack?.appToken) {
-      slackClient = new SlackClient(config.slack, auth);
-    }
+    // Every session with tokens gets a client: posting needs only the bot token. The socket opens
+    // later, and only in the router.
+    await replaceSlackClient(
+      config.slack?.botToken && config.slack?.appToken ? new SlackClient(config.slack, auth) : null,
+    );
 
-    // Auto-connect if configured
-    //
-    // Non-blocking: acquiring the lock is synchronous (cheap), but the actual
-    // Slack connection (jiti-transpiling @slack/bolt + auth.test() + Socket Mode
-    // start) is deferred to a background task. session_start is awaited by pi's
-    // extension runner, so awaiting the full connect() here would gate startup
-    // readiness on Slack connectivity (which can hang for a long time when the
-    // network isn't ready right after a machine restart).
-    if (slackClient && config.autoConnect !== false) {
-      if (!acquireLock()) {
-        ctx.ui.notify("ℹ️ slk-bridge: another instance is already connected — skipping auto-connect", "info");
-      } else {
-        void (async () => {
-          try {
-            await connectSlackBridge();
-          } catch (err) {
-            releaseLock();
-            ctx.ui.notify(`⚠️ Slack connection failed: ${(err as Error).message}`, "warning");
-          }
-        })();
-      }
-    }
-
-    // Wire Slack client message handler inside session_start (ctx is available)
-    if (slackClient) {
-      slackClient.onMessage((msg: ExternalMessage) => {
-        if (!ownsBridgeConnection()) return;
-
-        void handleIncomingRemoteMessage(msg).catch((err: Error) => {
-          ctx.ui.notify(`❌ Failed to handle Slack message: ${err.message}`, "error");
-        });
-      });
-
-      slackClient.onError((err: Error) => {
-        ctx.ui.notify(`❌ Slack error: ${err.message}`, "error");
-      });
-    }
-
-    ownershipTimer = setInterval(() => {
-      if (ownershipCheckInProgress || !isLockHeldLocally() || isCurrentLockOwner()) return;
-      ownershipCheckInProgress = true;
-
-      void (async () => {
-        await clearSlackWorkingReaction();
-        if (slackClient) {
-          await slackClient.disconnect();
-        }
-        pendingRemoteChat = null;
-        turnAccumulator = null;
-        releaseLock();
-        updateWidget();
-        ctx.ui.notify("🔄 slk-bridge connection moved to another session", "info");
-      })()
-        .catch((err) => {
-          ctx.ui.notify(`❌ Failed to release slk-bridge connection after ownership loss: ${(err as Error).message}`, "error");
-        })
-        .finally(() => {
-          ownershipCheckInProgress = false;
-        });
-    }, 250);
-
+    // Rejoin a session that joined before. Non-blocking by design: session_start is awaited by the
+    // host, and the router claim (jiti-transpiling @slack/bolt + auth.test() + Socket Mode start)
+    // runs from the election tick, never from here.
+    await reconcileMembership();
     updateWidget();
   });
 
-  pi.on("input", async (event, _context) => {
-    if (event.source !== "interactive" && event.source !== "rpc") {
-      return;
-    }
+  // OMP rebinds the live session in place and reports it with these events; upstream Pi tears the
+  // runtime down and fires session_start again instead. Either way membership follows the session file.
+  const ompSessionEvents = pi as unknown as {
+    on(
+      event: "session_switch" | "session_branch",
+      handler: (event: unknown, context: ExtensionContext) => Promise<void>,
+    ): void;
+  };
+  for (const eventName of ["session_switch", "session_branch"] as const) {
+    ompSessionEvents.on(eventName, async (_event, context) => {
+      ctx = context;
+      await reconcileMembership();
+      updateWidget();
+    });
+  }
 
-    const sessionFile = getCurrentSessionFile();
-    if (sessionFile) {
-      const config = loadConfig();
-      if (config.optedOutSessions?.includes(sessionFile)) {
-        return;
-      }
-    }
-
-    try {
-      await connectCurrentSession({ respectAutoConnect: true, handoverReason: "active-session", notifySlackHandover: false });
-    } catch (err) {
-      ctx.ui.notify(
-        `⚠️ slk-bridge could not move to this active session: ${(err as Error).message}`,
-        "warning",
-      );
-    }
-  });
   pi.on("message_end", async (event, context) => {
-    if (pendingRemoteChat || handoverPending || !ownsBridgeConnection()) return;
+    if (pendingRemoteChat || handoverPending || !canPost()) return;
     ctx = context;
-    const chatId = auth.getNotificationChatId();
+    const chatId = notificationChatId();
     if (!chatId) return;
-    const threadId = resolveThreadId(chatId);
-    if (!threadId) return;
     const message = event.message;
     if (message.role !== "assistant" || message.stopReason !== "stop") return;
     const text = extractTextFromMessage(message);
-    if (text) await sendToRemoteChat(chatId, text, { threadId, noFooter: true });
+    if (!text) return;
+    // A joined session owns a thread; create its root now if joining could not post one.
+    const sessionPath = getCurrentSessionFile();
+    const threadId = resolveThreadId(chatId)
+      ?? (sessionPath ? await ensureSessionThread(chatId, sessionPath) : undefined);
+    if (threadId) await sendToRemoteChat(chatId, text, { threadId, noFooter: true });
   });
 
   pi.on("turn_start", async (_event, _context) => {
-    if (pendingRemoteChat && ownsBridgeConnection()) {
+    if (pendingRemoteChat && canPost()) {
       try {
         await setSlackWorkingReaction(pendingRemoteChat);
       } catch {
@@ -1025,8 +1301,8 @@ export default function (pi: ExtensionAPI): void {
    * agent_end. This gives cleaner Slack output.
    */
   pi.on("turn_end", async (event, _context) => {
-    if (!pendingRemoteChat || !ownsBridgeConnection()) {
-      if (!ownsBridgeConnection()) {
+    if (!pendingRemoteChat || !canPost()) {
+      if (!canPost()) {
         pendingRemoteChat = null;
       }
       return;
@@ -1070,7 +1346,7 @@ export default function (pi: ExtensionAPI): void {
    */
   pi.on("agent_end", async (event, _context) => {
     // Branch 1: Message originated from Slack — flush accumulated turns
-    if (pendingRemoteChat && ownsBridgeConnection()) {
+    if (pendingRemoteChat && canPost()) {
       try {
         const totalEntries = turnAccumulator?.entries.length ?? 0;
         let lastSlackThreadId = turnAccumulator?.threadId;
@@ -1119,8 +1395,7 @@ export default function (pi: ExtensionAPI): void {
         if (threadTs) {
           // Background the history + final response replay so agent_end returns
           // quickly — pi can process the user's next Slack message without waiting
-          // for dozens of sequential Slack API calls. (Same pattern as
-          // notifySlackSessionHandover.) The thread is already remembered via the
+          // for dozens of sequential Slack API calls. The thread is already remembered via the
           // awaited header send above.
           void (async () => {
             try {
@@ -1164,22 +1439,16 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async (_event, _context) => {
-    if (ownershipTimer) {
-      clearInterval(ownershipTimer);
-      ownershipTimer = undefined;
-    }
-    await clearSlackWorkingReaction();
-    turnAccumulator = null;
-    if (slackClient) {
-      await slackClient.disconnect();
-    }
-    releaseLock();
+    // Hosts give shutdown handlers about two seconds: stopMembership caps every network step so the
+    // router lock and the registration are always released in time. The persisted join stays, so a
+    // restarted process for the same session rejoins.
+    await stopMembership();
   });
 
   // ── /slk-bridge command (TUI local) ────────────────────────────────────────
 
   pi.registerCommand("slk-bridge", {
-    description: "Manage Slack bridge connection (help|status|connect|disconnect|configure|widget|new|resume)",
+    description: "Manage the Slack bridge (help|status|connect|disconnect|router|configure|widget|new|resume)",
     handler: async (args: string, context) => {
       const parts = args.trim().split(/\s+/).filter((p) => p.length > 0);
       const subcommand = parts[0] || "";
@@ -1189,79 +1458,28 @@ export default function (pi: ExtensionAPI): void {
         await openMainMenu({
           ui: context.ui,
           reconnect: async () => {
-            const cfg = loadConfig();
-            slackClient = new SlackClient(cfg.slack!, auth);
-            await connectSlackBridge();
-            setupSlackMessageHandler();
+            await reconnectSlack();
           },
-          disconnect: async () => {
-            if (slackClient) {
-              await slackClient.disconnect();
-            }
-            releaseLock();
-            const cfg = loadConfig();
-            cfg.autoConnect = false;
-            saveConfig(cfg);
-            updateWidget();
-          },
+          disconnect: leaveCurrentSession,
           toggleToolCalls: () => {
-            const cfg = loadConfig();
-            cfg.hideToolCalls = !cfg.hideToolCalls;
-            saveConfig(cfg);
-            const state = cfg.hideToolCalls ? "hidden" : "shown";
-            context.ui.notify(`🔧 Tool calls ${state} in remote messages`, "info");
+            context.ui.notify(toggleToolCalls(), "info");
           },
           toggleAutoConnect: () => {
-            const cfg = loadConfig();
-            cfg.autoConnect = cfg.autoConnect === false;
-            saveConfig(cfg);
-            const state = cfg.autoConnect !== false ? "on" : "off";
-            context.ui.notify(`🔌 Auto-connect ${state}`, "info");
+            context.ui.notify(toggleAutoConnect(), "info");
           },
-          optOut: () => {
-            const sessionFile = getCurrentSessionFile();
-            if (!sessionFile) {
-              context.ui.notify("❌ No session file available for this session", "error");
-              return;
-            }
-            const cfg = loadConfig();
-            const optedOut = cfg.optedOutSessions ?? [];
-            if (optedOut.includes(sessionFile)) {
-              context.ui.notify("ℹ️ This session is already opted out of bridge takeover", "info");
-              return;
-            }
-            optedOut.push(sessionFile);
-            cfg.optedOutSessions = optedOut;
-            saveConfig(cfg);
-            context.ui.notify("🛑 This session will NOT take over the Slack bridge when active", "info");
-          },
-          optIn: () => {
-            const sessionFile = getCurrentSessionFile();
-            if (!sessionFile) {
-              context.ui.notify("❌ No session file available for this session", "error");
-              return;
-            }
-            const cfg = loadConfig();
-            const optedOut = cfg.optedOutSessions ?? [];
-            const idx = optedOut.indexOf(sessionFile);
-            if (idx === -1) {
-              context.ui.notify("ℹ️ This session was not opted out — nothing to do", "info");
-              return;
-            }
-            optedOut.splice(idx, 1);
-            cfg.optedOutSessions = optedOut.length > 0 ? optedOut : undefined;
-            saveConfig(cfg);
-            context.ui.notify("✅ This session can now take over the Slack bridge again", "info");
-          },
+          optOut: () => setSessionOptOut(context.ui, true),
+          optIn: () => setSessionOptOut(context.ui, false),
           getStatusLine: () => {
-            const connected = slackClient?.isConnected ?? false;
-            const stats = auth.getStats();
-            const cfg = loadConfig();
-            const statusLine = connected
-              ? "  ● Connected"
-              : "  ○ Disconnected";
-            const autoConnect = cfg.autoConnect !== false ? "on" : "off";
-            return `${statusLine}\n  Trusted user: ${stats.trustedUser ?? "None"}\n  Auto-connect: ${autoConnect}`;
+            const status = bridgeStatus();
+            const router = status.router === "this-session"
+              ? "this session"
+              : status.router === "other-session" ? "another session" : "none";
+            return [
+              `  ${status.joined ? "● Joined" : "○ Not joined"}`,
+              `  Router: ${router}`,
+              `  Trusted user: ${status.trustedUser ?? "None"}`,
+              `  Auto-claim router: ${status.autoConnect ? "on" : "off"}`,
+            ].join("\n");
           },
         });
         return;
@@ -1272,78 +1490,69 @@ export default function (pi: ExtensionAPI): void {
           context.ui.notify(buildBridgeHelpText(), "info");
           break;
 
-        case "status": {
-          const stats = auth.getStats();
-          context.ui.notify(
-            buildBridgeStatusText(slackIsConnected(), stats.trustedUser, stats.channels),
-            "info",
-          );
+        case "status":
+          context.ui.notify(buildBridgeStatusText(bridgeStatus()), "info");
           break;
-        }
 
         case "connect": {
           try {
-            const reasonArg = parts[1] === "user-request" || parts[1] === "active-session"
-              ? parts[1]
-              : "user-request";
-            const cfg = loadConfig();
-            cfg.autoConnect = true;
-            saveConfig(cfg);
-            await connectCurrentSession({ showTakeoverNotice: true, handoverReason: reasonArg });
-            context.ui.notify("✅ Connected to Slack", "info");
-            updateWidget();
+            const result = await joinCurrentSession({ postRoot: true, claim: "vacant" });
+            context.ui.notify(describeJoin(result), result.router === "none" ? "warning" : "info");
           } catch (err) {
-            releaseLock();
             context.ui.notify(`❌ Connection failed: ${(err as Error).message}`, "error");
           }
           break;
         }
 
         case "disconnect": {
-          await disconnectCurrentSession();
-          context.ui.notify("🔌 Disconnected from Slack", "info");
+          await leaveCurrentSession();
+          context.ui.notify("🔌 Left the Slack bridge", "info");
+          break;
+        }
+
+        case "router": {
+          try {
+            const result = await joinCurrentSession({ postRoot: true, claim: "force" });
+            const tookRouter = result.router === "this-session";
+            context.ui.notify(
+              tookRouter
+                ? "✅ This session is now the Slack router"
+                : `❌ Could not take the router role${result.error ? `: ${result.error}` : ""}`,
+              tookRouter ? "info" : "error",
+            );
+          } catch (err) {
+            context.ui.notify(`❌ Could not take the router role: ${(err as Error).message}`, "error");
+          }
           break;
         }
 
         case "configure": {
-          const token = parts.slice(1).join(" ");
-          const parts2 = token.split(/\s+/);
-          const botToken = parts2[0];
-          const appToken = parts2[1];
+          const botToken = parts[1];
+          const appToken = parts[2];
 
           if (!botToken || !appToken) {
             context.ui.notify("Usage: /slk-bridge configure <bot-token> <app-token>", "error");
             return;
           }
 
-          const config = loadConfig();
-          config.slack = { botToken, appToken };
-          saveConfig(config);
+          updateConfig((config) => {
+            config.slack = { botToken, appToken };
+          });
 
-          slackClient = new SlackClient(config.slack, auth);
-          if (acquireLock()) {
-            try {
-              await slackClient.connect();
-              setupSlackMessageHandler();
-              context.ui.notify("✅ Slack configured and connected", "info");
-            } catch (err) {
-              releaseLock();
-              context.ui.notify(`⚠️ Slack setup error: ${(err as Error).message}`, "error");
-            }
-          } else {
-            context.ui.notify(
-              "✅ Slack configured (another instance is connected — run /slk-bridge connect later)",
-              "info",
-            );
+          try {
+            const result = await reconnectSlack({ botToken, appToken });
+            context.ui.notify(`Slack configured. ${describeJoin(result)}`, result.router === "none" ? "warning" : "info");
+          } catch (err) {
+            context.ui.notify(`⚠️ Slack setup error: ${(err as Error).message}`, "error");
           }
           updateWidget();
           break;
         }
 
         case "widget": {
-          const cfg = loadConfig();
-          cfg.showWidget = cfg.showWidget === false;
-          saveConfig(cfg);
+          const cfg = updateConfig((config) => {
+            config.showWidget = config.showWidget === false;
+          });
           const widgetState = cfg.showWidget !== false ? "shown" : "hidden";
           context.ui.notify(`📊 Status widget ${widgetState}`, "info");
           updateWidget();
@@ -1411,6 +1620,9 @@ export default function (pi: ExtensionAPI): void {
         }
 
         case "releaseclaim": {
+          // Another process may have changed trust since this one started; release from the current state.
+          const stored = loadConfig().auth;
+          if (stored) auth.loadFromConfig(stored);
           const removed = auth.releaseClaim();
           context.ui.notify(
             `🔓 Re-opened Slack claim${removed > 0 ? ` (removed ${removed} trusted user${removed === 1 ? "" : "s"})` : ""}`,
@@ -1420,45 +1632,14 @@ export default function (pi: ExtensionAPI): void {
         }
 
         case "optout":
-        case "opt-out": {
-          const sessionFile = getCurrentSessionFile();
-          if (!sessionFile) {
-            context.ui.notify("❌ No session file available for this session", "error");
-            break;
-          }
-          const cfg = loadConfig();
-          const optedOut = cfg.optedOutSessions ?? [];
-          if (optedOut.includes(sessionFile)) {
-            context.ui.notify("ℹ️ This session is already opted out of bridge takeover", "info");
-            break;
-          }
-          optedOut.push(sessionFile);
-          cfg.optedOutSessions = optedOut;
-          saveConfig(cfg);
-          context.ui.notify("🛑 This session will NOT take over the Slack bridge when active", "info");
+        case "opt-out":
+          setSessionOptOut(context.ui, true);
           break;
-        }
 
         case "optin":
-        case "opt-in": {
-          const sessionFile = getCurrentSessionFile();
-          if (!sessionFile) {
-            context.ui.notify("❌ No session file available for this session", "error");
-            break;
-          }
-          const cfg = loadConfig();
-          const optedOut = cfg.optedOutSessions ?? [];
-          const idx = optedOut.indexOf(sessionFile);
-          if (idx === -1) {
-            context.ui.notify("ℹ️ This session was not opted out — nothing to do", "info");
-            break;
-          }
-          optedOut.splice(idx, 1);
-          cfg.optedOutSessions = optedOut.length > 0 ? optedOut : undefined;
-          saveConfig(cfg);
-          context.ui.notify("✅ This session can now take over the Slack bridge again", "info");
+        case "opt-in":
+          setSessionOptOut(context.ui, false);
           break;
-        }
 
         case "optout-list":
         case "optout list":
@@ -1467,10 +1648,10 @@ export default function (pi: ExtensionAPI): void {
           const cfg = loadConfig();
           const optedOut = cfg.optedOutSessions ?? [];
           if (optedOut.length === 0) {
-            context.ui.notify("📋 No sessions are currently opted out of bridge takeover", "info");
+            context.ui.notify("📋 No sessions are opted out of auto-claiming the router role", "info");
             break;
           }
-          const lines = ["📋 Opted-out sessions", ""];
+          const lines = ["📋 Sessions that never auto-claim the router role", ""];
           for (const s of optedOut) {
             lines.push(`  • ${s}`);
           }
@@ -1478,37 +1659,19 @@ export default function (pi: ExtensionAPI): void {
           break;
         }
 
-        case "toggletools": {
-          const cfg = loadConfig();
-          cfg.hideToolCalls = !cfg.hideToolCalls;
-          saveConfig(cfg);
-          const toolState = cfg.hideToolCalls ? "hidden" : "shown";
-          context.ui.notify(`🔧 Tool calls ${toolState} in remote messages`, "info");
+        case "toggletools":
+          context.ui.notify(toggleToolCalls(), "info");
           break;
-        }
 
-        case "autoconnect": {
-          const cfg = loadConfig();
-          cfg.autoConnect = cfg.autoConnect === false;
-          saveConfig(cfg);
-          const state = cfg.autoConnect !== false ? "on" : "off";
-          context.ui.notify(`🔌 Auto-connect ${state}`, "info");
+        case "autoconnect":
+          context.ui.notify(toggleAutoConnect(), "info");
           break;
-        }
 
         case "handover": {
-          // Preamble: opt in if needed, connect Slack if needed
+          // Preamble: opt in if needed, join the bridge if needed
           const sessionFile = getCurrentSessionFile();
-          if (sessionFile) {
-            const cfg = loadConfig();
-            const optedOut = cfg.optedOutSessions ?? [];
-            const idx = optedOut.indexOf(sessionFile);
-            if (idx !== -1) {
-              optedOut.splice(idx, 1);
-              cfg.optedOutSessions = optedOut.length > 0 ? optedOut : undefined;
-              saveConfig(cfg);
-              context.ui.notify("ℹ️ Session auto-opted in for handover", "info");
-            }
+          if (sessionFile && setOptedOut(sessionFile, false)) {
+            context.ui.notify("ℹ️ Session auto-opted in for handover", "info");
           }
 
           if (!hasConfiguredSlack()) {
@@ -1516,18 +1679,18 @@ export default function (pi: ExtensionAPI): void {
             break;
           }
 
-          if (!slackIsConnected()) {
-            try {
-              await connectSlackBridge();
-              context.ui.notify("✅ Slack connected for handover", "info");
-            } catch (err) {
-              context.ui.notify(`❌ Failed to connect Slack: ${(err as Error).message}`, "error");
-              break;
-            }
+          // The handover itself opens this session's thread, so joining posts no separate root.
+          try {
+            const wasJoined = isJoined();
+            await joinCurrentSession({ postRoot: false, claim: "vacant" });
+            if (!wasJoined) context.ui.notify("✅ Joined the Slack bridge for handover", "info");
+          } catch (err) {
+            context.ui.notify(`❌ Failed to join the Slack bridge: ${(err as Error).message}`, "error");
+            break;
           }
 
           // Get trusted user's DM chatId
-          const handoverChatId = auth.getNotificationChatId();
+          const handoverChatId = notificationChatId();
           if (!handoverChatId) {
             context.ui.notify("❌ No trusted user found. Authenticate a user first.", "error");
             break;
@@ -1598,9 +1761,8 @@ export default function (pi: ExtensionAPI): void {
               timestamp: new Date(payload.message.timestamp),
             };
 
-            await connectSlackBridge();
+            await joinCurrentSession({ postRoot: false, claim: "vacant" });
             await handleIncomingRemoteMessage(message, {
-              allowSessionRouting: false,
               replayLastAssistantMessage: payload.replayLastAssistantMessage === true,
             });
           } catch (err) {

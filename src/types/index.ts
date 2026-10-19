@@ -48,11 +48,17 @@ export interface SlackBridgeConfig {
     lastAssistantDeliveryByThread?: Record<string, { sessionPath: string; assistantEntryId: string; updatedAt: string }>;
   };
   hideToolCalls?: boolean;
+  /**
+   * Whether joined sessions claim the router role (the single Slack socket) on their own when no
+   * live router exists. Default on. Joining and leaving never touch this flag.
+   */
   autoConnect?: boolean;
   showWidget?: boolean;
   debug?: boolean;
-  /** Session file paths that have opted out of automatic bridge takeover */
+  /** Session file paths that never auto-claim the router role, even when `autoConnect` is on. */
   optedOutSessions?: string[];
+  /** Session file paths joined to the Slack bridge; a restarted process for the same session rejoins on start. */
+  joinedSessions?: string[];
 }
 
 /**

@@ -6,7 +6,7 @@
  */
 
 import { buildBridgeHelpText } from "../bridge/commands.js";
-import { loadConfig, saveConfig } from "../config/index.js";
+import { updateConfig } from "../config/index.js";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -19,22 +19,22 @@ export type MenuUI = {
 export interface MenuContext {
   ui: MenuUI;
 
-  /** Reconnect Slack with current config (create client, connect, wire handler). */
+  /** Rebuild the Slack client from the current config and join this session (becoming router if none is live). */
   reconnect: () => Promise<void>;
 
-  /** Disconnect Slack and release lock. */
+  /** Leave the bridge: unregister this session and, if it is the router, release the Slack socket. */
   disconnect: () => Promise<void>;
 
   /** Toggle tool call visibility in remote messages. */
   toggleToolCalls: () => void;
 
-  /** Toggle auto-connect on session resume. */
+  /** Toggle whether joined sessions auto-claim the router role when no live router exists. */
   toggleAutoConnect: () => void;
 
-  /** Opt current session out of automatic bridge takeover. */
+  /** Keep this session from auto-claiming the router role. */
   optOut: () => void;
 
-  /** Re-allow current session to take over the bridge. */
+  /** Allow this session to auto-claim the router role again. */
   optIn: () => void;
 
   /** Get a status line string for the menu title. */
@@ -46,7 +46,7 @@ export interface MenuContext {
 async function doConnect(mctx: MenuContext): Promise<void> {
   try {
     await mctx.reconnect();
-    mctx.ui.notify("✅ Slack connected", "info");
+    mctx.ui.notify("✅ Joined the Slack bridge", "info");
   } catch (err) {
     mctx.ui.notify(`❌ Connection failed: ${(err as Error).message}`, "error");
   }
@@ -54,23 +54,22 @@ async function doConnect(mctx: MenuContext): Promise<void> {
 
 async function doDisconnect(mctx: MenuContext): Promise<void> {
   await mctx.disconnect();
-  mctx.ui.notify("🔌 Slack disconnected", "info");
+  mctx.ui.notify("🔌 Left the Slack bridge", "info");
 }
 
 async function doConfigure(mctx: MenuContext): Promise<void> {
-  const config = loadConfig();
-
   const botToken = await mctx.ui.input("Slack bot token (xoxb-...)");
   if (!botToken) return;
   const appToken = await mctx.ui.input("Slack app token (xapp-...)");
   if (!appToken) return;
 
-  config.slack = { botToken, appToken };
-  saveConfig(config);
+  updateConfig((config) => {
+    config.slack = { botToken, appToken };
+  });
 
   try {
     await mctx.reconnect();
-    mctx.ui.notify("✅ Slack configured and connected", "info");
+    mctx.ui.notify("✅ Slack configured and joined", "info");
   } catch (err) {
     mctx.ui.notify(`⚠️ Slack setup error: ${(err as Error).message}`, "error");
   }

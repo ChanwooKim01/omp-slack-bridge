@@ -5,7 +5,8 @@
  * so incoming thread replies can be routed to the correct session.
  */
 
-import { loadConfig, saveConfig } from "../config/index.js";
+import { loadConfig, updateConfig } from "../config/index.js";
+import type { ExternalMessage, SlackBridgeConfig } from "../types/index.js";
 
 // ── Key helpers ────────────────────────────────────────────────────────────
 
@@ -19,12 +20,28 @@ export function getSlackSessionChatKey(sessionPath: string, chatId: string): str
 
 // ── State accessors ────────────────────────────────────────────────────────
 
+/** Read-only view of the persisted routing maps; writes go through `updateConfig` mutators below. */
 export function getSlackRoutingState() {
-  const config = loadConfig();
-  const threadsByKey = { ...(config.slackRouting?.threadsByKey ?? {}) };
-  const activeThreadBySessionChat = { ...(config.slackRouting?.activeThreadBySessionChat ?? {}) };
-  const lastAssistantDeliveryByThread = { ...(config.slackRouting?.lastAssistantDeliveryByThread ?? {}) };
-  return { config, threadsByKey, activeThreadBySessionChat, lastAssistantDeliveryByThread };
+  const routing = loadConfig().slackRouting;
+  return {
+    threadsByKey: routing?.threadsByKey ?? {},
+    activeThreadBySessionChat: routing?.activeThreadBySessionChat ?? {},
+    lastAssistantDeliveryByThread: routing?.lastAssistantDeliveryByThread ?? {},
+  };
+}
+
+/** The routing section of the freshly re-read config, created on demand inside an `updateConfig` mutator. */
+function routingSection(config: SlackBridgeConfig) {
+  config.slackRouting ??= {};
+  const routing = config.slackRouting;
+  routing.threadsByKey ??= {};
+  routing.activeThreadBySessionChat ??= {};
+  routing.lastAssistantDeliveryByThread ??= {};
+  return {
+    threadsByKey: routing.threadsByKey,
+    activeThreadBySessionChat: routing.activeThreadBySessionChat,
+    lastAssistantDeliveryByThread: routing.lastAssistantDeliveryByThread,
+  };
 }
 
 // ── Mutations ──────────────────────────────────────────────────────────────
@@ -40,18 +57,18 @@ export function rememberSlackThreadForSession(
   const resolvedSessionPath = sessionPath ?? getCurrentSessionFile?.();
   if (!resolvedSessionPath) return;
 
-  const { config, threadsByKey, activeThreadBySessionChat, lastAssistantDeliveryByThread } = getSlackRoutingState();
   const updatedAt = new Date().toISOString();
-  threadsByKey[getSlackThreadKey(chatId, threadTs)] = {
-    sessionPath: resolvedSessionPath,
-    updatedAt,
-  };
-  activeThreadBySessionChat[getSlackSessionChatKey(resolvedSessionPath, chatId)] = {
-    threadTs,
-    updatedAt,
-  };
-  config.slackRouting = { threadsByKey, activeThreadBySessionChat, lastAssistantDeliveryByThread };
-  saveConfig(config);
+  updateConfig((config) => {
+    const { threadsByKey, activeThreadBySessionChat } = routingSection(config);
+    threadsByKey[getSlackThreadKey(chatId, threadTs)] = {
+      sessionPath: resolvedSessionPath,
+      updatedAt,
+    };
+    activeThreadBySessionChat[getSlackSessionChatKey(resolvedSessionPath, chatId)] = {
+      threadTs,
+      updatedAt,
+    };
+  });
 }
 
 export function markLatestAssistantDeliveredToSlackThread(
@@ -67,14 +84,15 @@ export function markLatestAssistantDeliveredToSlackThread(
   const lastAssistantMessage = getLastAssistantMessageInfo?.();
   if (!resolvedSessionPath || !lastAssistantMessage) return;
 
-  const { config, threadsByKey, activeThreadBySessionChat, lastAssistantDeliveryByThread } = getSlackRoutingState();
-  lastAssistantDeliveryByThread[getSlackThreadKey(chatId, threadTs)] = {
-    sessionPath: resolvedSessionPath,
-    assistantEntryId: lastAssistantMessage.entryId,
-    updatedAt: new Date().toISOString(),
-  };
-  config.slackRouting = { threadsByKey, activeThreadBySessionChat, lastAssistantDeliveryByThread };
-  saveConfig(config);
+  const updatedAt = new Date().toISOString();
+  updateConfig((config) => {
+    const { lastAssistantDeliveryByThread } = routingSection(config);
+    lastAssistantDeliveryByThread[getSlackThreadKey(chatId, threadTs)] = {
+      sessionPath: resolvedSessionPath,
+      assistantEntryId: lastAssistantMessage.entryId,
+      updatedAt,
+    };
+  });
 }
 
 export function hasLatestAssistantBeenDeliveredToSlackThread(
@@ -108,4 +126,43 @@ export function getRememberedSlackThreadForCurrentSession(
   const sessionPath = getCurrentSessionFile?.();
   if (!sessionPath) return undefined;
   return getSlackRoutingState().activeThreadBySessionChat[getSlackSessionChatKey(sessionPath, chatId)]?.threadTs;
+}
+
+// ── Inbound routing ────────────────────────────────────────────────────────
+
+/** Posted into a thread whose owning session has no live process. */
+export const SESSION_OFFLINE_NOTICE = "이 스레드의 세션이 꺼져 있습니다. Paseo에서 해당 에이전트를 열면 다시 연결됩니다.";
+
+/** `.bridge resume` acts on the process that receives it, whichever session owns the thread. */
+export function isExplicitRemoteResumeCommand(content: string): boolean {
+  return /^\.bridge\s+resume(?:\s|$)/i.test(content.trim());
+}
+
+export type InboundRoute =
+  /** Handle in the receiving (router) session. */
+  | { kind: "local" }
+  /** Another live session owns the thread: hand the message to its inbox. */
+  | { kind: "inbox"; sessionPath: string }
+  /** The owning session is not running: tell the user instead of guessing. */
+  | { kind: "offline"; sessionPath: string };
+
+/**
+ * Decide where a message the router just received must be handled. Only a thread reply in a
+ * thread owned by a different session leaves the router: top-level and unmapped messages, the
+ * router's own threads, and explicit resume commands stay local.
+ */
+export function decideInboundRoute(
+  message: Pick<ExternalMessage, "chatId" | "content" | "threadId" | "isThreadReply">,
+  currentSessionPath: string | undefined,
+  isSessionLive: (sessionPath: string) => boolean,
+): InboundRoute {
+  if (!message.threadId || !message.isThreadReply) return { kind: "local" };
+  if (isExplicitRemoteResumeCommand(message.content)) return { kind: "local" };
+
+  const ownerSessionPath = getSlackThreadOwnerSession(message.chatId, message.threadId);
+  if (!ownerSessionPath || ownerSessionPath === currentSessionPath) return { kind: "local" };
+
+  return isSessionLive(ownerSessionPath)
+    ? { kind: "inbox", sessionPath: ownerSessionPath }
+    : { kind: "offline", sessionPath: ownerSessionPath };
 }

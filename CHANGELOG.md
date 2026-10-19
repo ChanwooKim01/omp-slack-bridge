@@ -2,6 +2,41 @@
 
 ## Local OMP adaptation — unreleased
 
+### Multi-session router and inbox
+
+Several OMP sessions (for example Paseo agents, each its own `omp` process) can now use one Slack DM at the same time, one thread per session, with no LLM relay. Slack delivers each Socket Mode event to one open connection per app token, so exactly one process — the router, the owner of `slk-bridge.lock` — holds the socket; it hands thread replies to the owning session through a per-session inbox.
+
+**Added**
+- **Join / leave.** `/slk-bridge connect` joins the current session: registers it, remembers the join in `slk-bridge.json` (`joinedSessions`) so a restarted process for the same session rejoins on start, posts or reuses the session's root thread in the paired DM, and becomes the router only if no live router exists. `/slk-bridge disconnect` leaves: unregisters, forgets the join, deletes queued messages, and releases the router role and the socket if held. `.bridge connect|disconnect|status` work the same from Slack.
+- **`/slk-bridge router`** takes the router role from a live router explicitly. Joining never does.
+- **Router election.** Every joined session checks every ~2 s and, when no live process owns the lock, claims it and opens the socket. A router that loses the lock closes its socket within ~250 ms, also when the local flag was already cleared. Failed automatic claims back off (up to 60 s) instead of retrying every tick.
+- **Session registry** `~/.omp/agent/slk-bridge-sessions/<sha1(sessionPath)>.json` (`{sessionPath, pid, instanceId, updatedAt}`), written on join and on session start/switch, removed on leave and shutdown; a session is live while its PID is alive. A joined session re-creates its record if it vanishes.
+- **Inbox** `~/.omp/agent/slk-bridge-inbox/<sha1>/<ms>-<id>.json`. For a thread reply owned by another live session the router writes the message atomically and stops; the owner polls every ~500 ms, deletes each file when read, de-duplicates by `chat:ts`, and feeds it into the normal Slack path (questions, remote commands, ⏳ reaction, follow-up while busy). Messages older than 10 minutes are dropped when read.
+- **Offline notice.** A reply in a thread whose session is not running gets *"이 스레드의 세션이 꺼져 있습니다. Paseo에서 해당 에이전트를 열면 다시 연결됩니다."* in that thread; it replaces the old "이전 세션의 스레드입니다…" notice. `.bridge resume` is still handled by the router wherever it is written.
+- **Posting without the socket.** `@slack/web-api` is now an explicit dependency; `SlackClient` posts messages and threads, adds and removes reactions and uploads files with the bot token alone. Replies, reactions, uploads, mirrored answers and question/approval alerts work for any joined session; a session that has not joined stays silent.
+- **`updateConfig(mutator)`** replaces raw read-modify-write of `slk-bridge.json`: cross-process lock file (exclusive create, short backoff, stale-lock recovery), re-read under the lock, atomic temp-file + rename write. It never writes when the file does not parse and never persists `PI_SLACK_*` environment tokens. All writers (thread routing, auth, `autoConnect`, opt-out list, join list, widget and tool-call toggles, menu configure) use it.
+- Tests: routing decision, inbox consume-once, registry, `updateConfig` with real concurrent processes, simultaneous router claimants in real processes, lock loss, join/leave/election, outbound posting without a socket, and two full bridge instances sharing one DM (`tests/bridge/router-inbox.test.ts`, `tests/bridge/two-sessions.test.ts`).
+
+**Changed**
+- `acquireLock()` now claims a vacant lock with an exclusive file create, so two processes claiming at the same moment cannot both win. `isProcessAlive` is exported.
+- `autoConnect` (default on) only decides whether joined sessions claim a vacant router role on their own; `connect`/`disconnect` no longer flip it. `optedOutSessions` now means "never auto-claim the router role".
+- Ownership checks no longer gate posting: the Paseo question/approval callback, mirrored answers, the ⏳ reaction, file upload and the turn/agent-end flush check *joined*, not *router*. Only receiving from Slack requires the lock.
+- The paired DM is read from the config file, so a session that started before pairing or revocation never posts to a stale chat. A process that becomes router refreshes its trust state from the config (`ChallengeAuth.loadFromConfig` now replaces state).
+- `/slk-bridge status`, the menu status line, the widget (`● slk router` / `● slk` / `○ slk`) and the help text show join and router state.
+
+**Removed**
+- The `input` hook that took over the Slack connection on every interactive/RPC input, and the takeover handover notice (`🔄 Session changed` plus history replay).
+- `saveConfig` (replaced by `updateConfig`), the unused cross-session tmux handoff writer and its handoff directory creation, `getSlackHandoverReasonText`. `/slk-bridge connect user-request` still works; the argument is ignored.
+
+**Fixed**
+- Orphan Socket Mode connections: the previous client is disconnected before it is replaced on `/slk-bridge configure`, menu reconnect and a repeated `session_start`; membership timers are cleared on session start, switch and shutdown; a failed connect now disconnects instead of only releasing the lock.
+- Concurrent processes no longer lose each other's updates to `slk-bridge.json`, no longer wipe tokens after reading a half-written file, and no longer write environment-provided tokens into it.
+- Timers and detached promises cannot throw into the host: every background task reports failures instead (an uncaught throw would take the whole OMP session down).
+
+> Windows: replacing the config file by rename gives it the ACL inherited from `~/.omp/agent/` instead of an ACL set on the old file alone.
+
+### Earlier OMP adaptation changes
+
 - Post one top-level root per session (`📁 project (branch) · path` plus the first prompt) and send that session's question alerts and permission notices as owner-mentioned replies in its thread, so parallel sessions no longer pile up top-level messages.
 - Resolve the remembered thread from the persisted per-session mapping only; the old chat-keyed in-memory cache could reuse a previous session's thread after `/new`, `/resume`, or a branch. Alerts pin the session that raised them, so a session switch mid-post cannot remap the thread.
 - Apply the "previous session's thread" guard to channels as well as DMs, and keep that thread owned by its session when the notice is sent, so a reply in another session's thread never becomes the active session's prompt.
@@ -11,7 +46,7 @@
 - Ignore late answers (option number, option label, or `id: answer`) to a closed question in its thread and say so; ordinary messages in the shared session thread still reach the agent. A Slack reply answers a pending question only if it was posted after that question's alert. Cancel decisions on session changes instead of granting implicit approval.
 - Reuse the configured trusted user/channel, retain channel thread IDs without optional metadata permissions, and suppress duplicate message deliveries within the running connection.
 - Store the local OMP bridge configuration and lock under `~/.omp/agent/`; use Windows ACL protection rather than interpreting POSIX mode bits as Windows permissions.
-- Keep the upstream single-active-session model. Use Paseo, not tmux/Pi commands, for Windows session management.
+- Use Paseo, not tmux/Pi commands, for Windows session management. (The upstream single-active-session model no longer applies: see "Multi-session router and inbox" above.)
 
 
 ## [0.3.0] - 2026-08-18

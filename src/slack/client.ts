@@ -35,6 +35,39 @@ async function loadSlackBolt() {
   return slack;
 }
 
+// Lazy like @slack/bolt: loading the Slack SDK is slow, and a session that never posts should not pay for it
+// (sessions start before the network is necessarily up).
+async function loadSlackWebApi() {
+  return import("@slack/web-api");
+}
+
+/**
+ * Errors from the Web API carry the machine-readable code in `data.error`; transport errors in `code`.
+ */
+function slackErrorCode(error: unknown): string {
+  if (error && typeof error === "object") {
+    if ("data" in error && error.data && typeof error.data === "object" && "error" in error.data && error.data.error) {
+      return String(error.data.error);
+    }
+    if ("code" in error && error.code) return String(error.code);
+    if ("message" in error && error.message) return String(error.message);
+  }
+  return String(error);
+}
+
+/**
+ * The slice of the Slack Web API this client calls. Typed structurally so Block Kit payloads built
+ * elsewhere stay loosely typed; the real WebClient is cast to it once, where it is constructed.
+ */
+interface SlackWebApi {
+  chat: { postMessage(args: Record<string, unknown>): Promise<{ ts?: string }> };
+  reactions: {
+    add(args: { channel: string; timestamp: string; name: string }): Promise<unknown>;
+    remove(args: { channel: string; timestamp: string; name: string }): Promise<unknown>;
+  };
+  files: { uploadV2(args: Record<string, unknown>): Promise<unknown> };
+}
+
 // Fail-fast guard for the Socket Mode connect. The underlying @slack/socket-mode
 // client retries `apps.connections.open` with exponential backoff (retries: 100,
 // factor: 1.3, maxTimeout: Infinity), so an unreachable Slack can otherwise block
@@ -55,11 +88,16 @@ async function timeoutReject(ms: number): Promise<symbol> {
 }
 
 /**
- * Slack client using @slack/bolt via Socket Mode
+ * Slack client.
+ *
+ * Receiving uses @slack/bolt over Socket Mode and is only done by the router session.
+ * Sending (messages, reactions, file uploads) uses the Web API with the bot token alone,
+ * so every joined session can post whether or not it holds the socket.
  */
 export class SlackClient {
   readonly type = "slack";
   private app: App | null = null;
+  private web: Promise<SlackWebApi> | null = null;
   private _isConnected = false;
   private botUserId: string = "";
   private messageHandler?: (message: ExternalMessage) => void;
@@ -203,6 +241,10 @@ export class SlackClient {
       const userId = message.user;
       const channelId = message.channel;
       const ts = message.ts;
+      // Trust may have changed in another process since the last message (for example a release of
+      // the claim from a non-router session): refresh first so the trusted-user filter below and the
+      // authorization check further down work from the same current state.
+      this.auth.refreshFromConfig();
       const pairing = this.auth.exportConfig();
       const trustedUser = pairing.trustedUser?.split(":")[0];
       if (trustedUser && userId !== trustedUser) return;
@@ -267,12 +309,8 @@ export class SlackClient {
 
       // Check authorization
       const sendMessageToUser = async (cId: string, text: string) => {
-        if (this.app) {
-          await this.app.client.chat.postMessage({
-            channel: cId,
-            text: text,
-          });
-        }
+        const web = await this.getWebClient();
+        await web.chat.postMessage({ channel: cId, text });
       };
 
       const isAuthorized = await this.auth.checkAuthorization(
@@ -378,6 +416,22 @@ export class SlackClient {
     await this.sendMessageInThread(chatId, text);
   }
 
+  /** Web API client built from the bot token alone; the Socket Mode connection is never required. */
+  private async getWebClient(): Promise<SlackWebApi> {
+    if (!this.config.botToken) {
+      throw new Error("Slack bot token is not configured");
+    }
+    this.web ??= loadSlackWebApi()
+      .then(({ WebClient, LogLevel }) =>
+        // Boundary cast: SlackWebApi is the structural subset of WebClient used here.
+        new WebClient(this.config.botToken, { logLevel: LogLevel.ERROR }) as unknown as SlackWebApi)
+      .catch((error) => {
+        this.web = null;
+        throw error;
+      });
+    return this.web;
+  }
+
   async sendMessageInThread(
     chatId: string,
     text: string,
@@ -385,10 +439,8 @@ export class SlackClient {
     footerText?: string,
     onPosted?: (lastTs: string) => void,
   ): Promise<string | undefined> {
-    if (!this.app) {
-      throw new Error("Slack not connected");
-    }
     if (!text?.trim()) return threadTs;
+    const web = await this.getWebClient();
 
     try {
       const messageChunks = splitMarkdownIntoMessages(text);
@@ -404,7 +456,7 @@ export class SlackClient {
           });
         }
 
-        const response = await this.app.client.chat.postMessage({
+        const response = await web.chat.postMessage({
           channel: chatId,
           text: chunk,
           blocks,
@@ -428,45 +480,38 @@ export class SlackClient {
   }
 
   async addReaction(chatId: string, messageTs: string, emoji: string): Promise<void> {
-    if (!this.app) {
-      throw new Error("Slack not connected");
-    }
+    const web = await this.getWebClient();
 
     try {
-      await this.app.client.reactions.add({
+      await web.reactions.add({
         channel: chatId,
         timestamp: messageTs,
         name: emoji,
       });
-    } catch (error: any) {
-      const code = error?.data?.error || error?.code || error?.message;
+    } catch (error) {
+      const code = slackErrorCode(error);
       if (code === "already_reacted") return;
-      throw new Error(`Slack add reaction failed: ${String(code)}`);
+      throw new Error(`Slack add reaction failed: ${code}`);
     }
   }
 
   async removeReaction(chatId: string, messageTs: string, emoji: string): Promise<void> {
-    if (!this.app) {
-      throw new Error("Slack not connected");
-    }
+    const web = await this.getWebClient();
 
     try {
-      await this.app.client.reactions.remove({
+      await web.reactions.remove({
         channel: chatId,
         timestamp: messageTs,
         name: emoji,
       });
-    } catch (error: any) {
-      const code = error?.data?.error || error?.code || error?.message;
+    } catch (error) {
+      const code = slackErrorCode(error);
       if (code === "no_reaction" || code === "message_not_found") return;
-      throw new Error(`Slack remove reaction failed: ${String(code)}`);
+      throw new Error(`Slack remove reaction failed: ${code}`);
     }
   }
 
   async sendFile(chatId: string, filePath: string, options?: TransportFileOptions): Promise<void> {
-    if (!this.app) {
-      throw new Error("Slack not connected");
-    }
     if (!fs.existsSync(filePath)) {
       throw new Error(`File not found: ${filePath}`);
     }
@@ -476,8 +521,9 @@ export class SlackClient {
       throw new Error(`Not a file: ${filePath}`);
     }
 
+    const web = await this.getWebClient();
     try {
-      await this.app.client.files.uploadV2({
+      await web.files.uploadV2({
         channel_id: chatId,
         file: fs.createReadStream(filePath),
         filename: path.basename(filePath),

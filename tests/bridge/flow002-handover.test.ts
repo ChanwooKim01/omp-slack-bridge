@@ -45,6 +45,8 @@ describe('FLOW-002 handover (busy)', () => {
     // Busy handover: fire the command (it awaits agent_end), then drive agent_end.
     const cmdCtx = { ui: { notify: (m: string, l: string) => h.notifyCalls.push([m, l]) }, isIdle: () => h.state.cmdIdle };
     const cmdPromise = h.registeredCommand.handler('handover', cmdCtx);
+    // Joining the bridge precedes the wait, so the command reaches it a few ticks after it starts.
+    await h.waitForNotification('Waiting for agent to finish');
 
     await h.invokeAgentEnd({
       messages: [
@@ -89,6 +91,8 @@ describe('FLOW-002 handover (busy)', () => {
 
     const cmdCtx = { ui: { notify: (m: string, l: string) => h.notifyCalls.push([m, l]) }, isIdle: () => h.state.cmdIdle };
     const cmdPromise = h.registeredCommand.handler('handover', cmdCtx);
+    // Joining the bridge precedes the wait, so the command reaches it a few ticks after it starts.
+    await h.waitForNotification('Waiting for agent to finish');
     await h.invokeAgentEnd({
       messages: [{ role: 'assistant', content: [{ type: 'text', text: 'hi there' }], stopReason: 'stop' }],
     });

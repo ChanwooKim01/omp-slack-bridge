@@ -108,6 +108,8 @@ describe('FLOW-003 continuation after handover', () => {
     //    which creates the new thread and pushes history + final response.
     const cmdCtx = { ui: { notify: (m: string, l: string) => h.notifyCalls.push([m, l]) }, isIdle: () => h.state.cmdIdle };
     const cmdPromise = h.registeredCommand.handler('handover', cmdCtx);
+    // Joining the bridge precedes the wait, so the command reaches it a few ticks after it starts.
+    await h.waitForNotification('Waiting for agent to finish');
     await h.invokeAgentEnd({
       messages: [{ role: 'assistant', content: [{ type: 'text', text: finalAssistantText }], stopReason: 'stop' }],
     });
@@ -161,6 +163,8 @@ describe('FLOW-003 continuation after handover', () => {
 
     const cmdCtx = { ui: { notify: (m: string, l: string) => h.notifyCalls.push([m, l]) }, isIdle: () => h.state.cmdIdle };
     const cmdPromise = h.registeredCommand.handler('handover', cmdCtx); // waits for agent_end
+    // Joining the bridge precedes the wait, so the command reaches it a few ticks after it starts.
+    await h.waitForNotification('Waiting for agent to finish');
 
     // Fire agent_end WITHOUT awaiting: it will send header (send 0), then history
     // (sends 1..n) all deferred. Resolve ONLY the header, leaving history pending.

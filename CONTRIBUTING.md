@@ -51,11 +51,15 @@ src/
 ├── session/
 │   ├── tmux.ts               # tmux-backed session management
 │   ├── handlers.ts           # Session switching and handoff logic
-│   └── lock.ts               # Single-instance lock guard
+│   ├── lock.ts               # Router lock: its owner holds the one Slack socket
+│   ├── registry.ts           # Registry of joined sessions (liveness = PID alive)
+│   └── inbox.ts              # Per-session inbox the router hands messages through
 ├── auth/
 │   └── challenge.ts          # Challenge-based user authentication
 ├── config/
-│   └── index.ts              # Config loading and validation
+│   └── index.ts              # Config loading and cross-process-safe updates
+├── util/
+│   └── atomic-write.ts       # Atomic file replacement and synchronous sleep
 ├── types/
 │   └── index.ts              # TypeScript interfaces and types
 └── ui/
@@ -87,7 +91,9 @@ Manual testing checklist:
 - [ ] Slack Block Kit markdown formatting renders properly
 - [ ] File uploads and downloads work
 - [ ] Session management works (new, list-sessions, switch)
-- [ ] Opt in/out of bridge takeover works
+- [ ] Opt in/out of automatic router claiming works
+- [ ] Two sessions join (`/slk-bridge connect`): one is router, replies in each session's thread reach that session
+- [ ] Leaving or closing the router session hands the router role to another joined session
 - [ ] Widget displays correct status
 - [ ] Deterministic dot commands work (`.bridge`)
 

@@ -57,7 +57,8 @@
     "@earendil-works/pi-tui": ">=0.74"
   },
   "dependencies": {
-    "@slack/bolt": "^4.6.0"
+    "@slack/bolt": "^4.6.0",
+    "@slack/web-api": "^7.15.2"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.14",

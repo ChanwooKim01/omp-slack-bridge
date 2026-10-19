@@ -123,4 +123,32 @@ These two are currently *observed* regressions. Static code reading suggests the
 
 ---
 
-_Add flows below. Number sequentially (FLOW-004, FLOW-005, ...)._ 
+## FLOW-004 — Use several sessions from one Slack DM
+
+**Actor:** trusted Slack user, with two or more OMP sessions (separate processes) running
+**Goal:** talk to each session in its own thread, at the same time, without the bridge guessing which session a message is for
+
+### Steps (from the user's perspective)
+1. In each session the user runs `/slk-bridge connect`. Each session posts (or reuses) its own root thread in the DM. The first one to join also becomes the router and holds the Slack connection; later ones do not take it.
+2. The user replies in session B's thread. The message reaches B's agent, and B's answer appears in B's thread — even though session A holds the Slack connection.
+3. The user replies in session A's thread. It goes to A.
+4. Session A runs `/slk-bridge disconnect` (or its process ends). Another joined session claims the Slack connection within a couple of seconds.
+5. The user replies in A's thread again. The router answers in that thread that the session is not running.
+
+### Expected outcome
+Exactly one process holds the Slack connection at any time, every thread reaches the session that owns it, and a dead session is reported instead of its messages going to a different session.
+
+### Acceptance criteria
+- [ ] `/slk-bridge connect` never takes the router role from a live router; `/slk-bridge router` does
+- [ ] A reply in another live session's thread is written to that session's inbox, handled there exactly once, and the file is removed
+- [ ] A reply in a thread whose session is not running gets the "session is off" notice and is not handled by any session
+- [ ] Top-level messages and replies in unowned threads are handled by the router session; `.bridge resume` stays with the router
+- [ ] A router that loses the lock closes its socket, even when its local flag was already cleared
+- [ ] A joined session that is not the router can post, react, upload and send question alerts; a session that has not joined is silent
+- [ ] Concurrent writers never lose each other's updates to `slk-bridge.json`
+
+> **Test status:** ✅ Covered by `tests/bridge/router-inbox.test.ts` (harness, fake lock), `tests/bridge/two-sessions.test.ts` (two bridge instances, real lock/config/registry/inbox), `tests/session/lock.test.ts` and `tests/config/update-config.test.ts` (real concurrent processes).
+
+---
+
+_Add flows below. Number sequentially (FLOW-005, FLOW-006, ...)._

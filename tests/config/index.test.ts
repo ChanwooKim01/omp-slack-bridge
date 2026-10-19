@@ -33,9 +33,9 @@ describe('config', () => {
   });
 
   it('saves and loads config roundtrip', async () => {
-    const { loadConfig, saveConfig } = await importConfig();
+    const { loadConfig, updateConfig } = await importConfig();
 
-    saveConfig({ slack: { botToken: 'xoxb-test', appToken: 'xapp-test' }, autoConnect: true, debug: false });
+    updateConfig((config) => Object.assign(config, { slack: { botToken: 'xoxb-test', appToken: 'xapp-test' }, autoConnect: true, debug: false }));
     const loaded = loadConfig();
 
     expect(loaded.slack?.botToken).toBe('xoxb-test');
@@ -45,25 +45,25 @@ describe('config', () => {
   });
 
   it.runIf(process.platform !== 'win32')('restricts the configuration directory to its POSIX owner', async () => {
-    const { saveConfig } = await importConfig();
-    saveConfig({});
+    const { updateConfig } = await importConfig();
+    updateConfig((config) => Object.assign(config, { autoConnect: true }));
 
     const stats = statSync(join(tmpDir, '.omp', 'agent'));
     expect(stats.mode & 0o777).toBe(0o700);
   });
 
   it.runIf(process.platform !== 'win32')('restricts the credential file to its POSIX owner', async () => {
-    const { saveConfig } = await importConfig();
-    saveConfig({});
+    const { updateConfig } = await importConfig();
+    updateConfig((config) => Object.assign(config, { autoConnect: true }));
 
     const stats = statSync(join(tmpDir, '.omp', 'agent', 'slk-bridge.json'));
     expect(stats.mode & 0o777).toBe(0o600);
   });
 
   it('env vars override file values', async () => {
-    const { loadConfig, saveConfig } = await importConfig();
+    const { loadConfig, updateConfig } = await importConfig();
 
-    saveConfig({ slack: { botToken: 'xoxb-file', appToken: 'xapp-file' }, autoConnect: true });
+    updateConfig((config) => Object.assign(config, { slack: { botToken: 'xoxb-file', appToken: 'xapp-file' }, autoConnect: true }));
     process.env.PI_SLACK_BOT_TOKEN = 'xoxb-env';
     process.env.PI_SLACK_APP_TOKEN = 'xapp-env';
 
@@ -119,9 +119,9 @@ describe('config', () => {
   });
 
   it('saves and loads hideToolCalls config', async () => {
-    const { loadConfig, saveConfig } = await importConfig();
+    const { loadConfig, updateConfig } = await importConfig();
 
-    saveConfig({ hideToolCalls: true, autoConnect: true });
+    updateConfig((config) => Object.assign(config, { hideToolCalls: true, autoConnect: true }));
     const loaded = loadConfig();
 
     expect(loaded.hideToolCalls).toBe(true);

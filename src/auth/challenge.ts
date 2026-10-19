@@ -2,7 +2,7 @@
  * Challenge-based authentication for Slack bridge users
  */
 
-import { loadConfig, saveConfig } from "../config/index.js";
+import { getConfigVersion, loadConfig, updateConfig } from "../config/index.js";
 
 /**
  * Parse a trustedUser config value which can be:
@@ -51,7 +51,9 @@ export class ChallengeAuth {
   ) {}
 
   /**
-   * Initialize auth state from config
+   * Replace auth state with what the config holds. Used at startup and again whenever this
+   * process becomes the router, so a trust change another process saved is never overridden
+   * by stale memory.
    */
   loadFromConfig(config: {
     trustedUser?: string;
@@ -59,20 +61,27 @@ export class ChallengeAuth {
     userChats?: Record<string, string>;
     claimOpen?: boolean;
   }): void {
-    if (config.trustedUser) {
-      const parsed = parseTrustedUser(config.trustedUser);
-      this.trustedUserId = parsed.userId;
-      this.trustedUsername = parsed.username;
-    }
-    if (config.channels) {
-      this.channelAuth = new Map(Object.entries(config.channels));
-    }
-    if (config.userChats) {
-      this.userChats = new Map(Object.entries(config.userChats));
-    }
-    if (config.claimOpen !== undefined) {
-      this.claimOpen = config.claimOpen;
-    }
+    const trusted = config.trustedUser ? parseTrustedUser(config.trustedUser) : undefined;
+    this.trustedUserId = trusted?.userId;
+    this.trustedUsername = trusted?.username;
+    this.channelAuth = new Map(Object.entries(config.channels ?? {}));
+    this.userChats = new Map(Object.entries(config.userChats ?? {}));
+    this.claimOpen = config.claimOpen ?? true;
+  }
+
+  private configVersion: string | undefined;
+
+  /**
+   * Pick up trust changes another process saved, for example `/slk-bridge releaseclaim` run in a
+   * session that is not the router. The router calls this before it filters or authorizes an inbound
+   * message, so both steps see the same state. The config is re-read only when the file changed.
+   */
+  refreshFromConfig(): void {
+    const version = getConfigVersion();
+    if (version === this.configVersion) return;
+    this.configVersion = version;
+    const stored = loadConfig().auth;
+    if (stored) this.loadFromConfig(stored);
   }
 
   /**
@@ -283,9 +292,9 @@ export class ChallengeAuth {
       }
 
       case "/toggletools": {
-        const cfg = loadConfig();
-        cfg.hideToolCalls = !cfg.hideToolCalls;
-        saveConfig(cfg);
+        const cfg = updateConfig((config) => {
+          config.hideToolCalls = !config.hideToolCalls;
+        });
         const state = cfg.hideToolCalls ? "hidden" : "shown";
         await sendMessage(`🔧 Tool calls ${state} in remote messages`);
         return true;
