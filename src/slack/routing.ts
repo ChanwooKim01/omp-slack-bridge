@@ -6,7 +6,7 @@
  */
 
 import { loadConfig, updateConfig } from "../config/index.js";
-import type { ExternalMessage, SlackBridgeConfig } from "../types/index.js";
+import type { ExternalMessage, SlackBridgeConfig, SlackThreadMeta } from "../types/index.js";
 
 // ── Key helpers ────────────────────────────────────────────────────────────
 
@@ -27,6 +27,7 @@ export function getSlackRoutingState() {
     threadsByKey: routing?.threadsByKey ?? {},
     activeThreadBySessionChat: routing?.activeThreadBySessionChat ?? {},
     lastAssistantDeliveryByThread: routing?.lastAssistantDeliveryByThread ?? {},
+    threadMeta: routing?.threadMeta ?? {},
   };
 }
 
@@ -37,10 +38,12 @@ function routingSection(config: SlackBridgeConfig) {
   routing.threadsByKey ??= {};
   routing.activeThreadBySessionChat ??= {};
   routing.lastAssistantDeliveryByThread ??= {};
+  routing.threadMeta ??= {};
   return {
     threadsByKey: routing.threadsByKey,
     activeThreadBySessionChat: routing.activeThreadBySessionChat,
     lastAssistantDeliveryByThread: routing.lastAssistantDeliveryByThread,
+    threadMeta: routing.threadMeta,
   };
 }
 
@@ -126,6 +129,36 @@ export function getRememberedSlackThreadForCurrentSession(
   const sessionPath = getCurrentSessionFile?.();
   if (!sessionPath) return undefined;
   return getSlackRoutingState().activeThreadBySessionChat[getSlackSessionChatKey(sessionPath, chatId)]?.threadTs;
+}
+
+// ── Thread title and summary ───────────────────────────────────────────────
+
+export function getSlackThreadMeta(chatId: string, threadTs: string): SlackThreadMeta | undefined {
+  return getSlackRoutingState().threadMeta[getSlackThreadKey(chatId, threadTs)];
+}
+
+/**
+ * Merge `patch` into a thread's stored title and summary. A field set to `undefined` in the patch
+ * keeps its stored value; the record is created on first use. Returns the record as stored.
+ */
+export function updateSlackThreadMeta(
+  chatId: string,
+  threadTs: string,
+  patch: Partial<Omit<SlackThreadMeta, "updatedAt">>,
+): SlackThreadMeta {
+  const key = getSlackThreadKey(chatId, threadTs);
+  const updatedAt = new Date().toISOString();
+  let stored: SlackThreadMeta = { updatedAt };
+  updateConfig((config) => {
+    const { threadMeta } = routingSection(config);
+    const next: SlackThreadMeta = { ...threadMeta[key], updatedAt };
+    if (patch.title !== undefined) next.title = patch.title;
+    if (patch.summary !== undefined) next.summary = patch.summary;
+    if (patch.summaryTs !== undefined) next.summaryTs = patch.summaryTs;
+    threadMeta[key] = next;
+    stored = next;
+  });
+  return stored;
 }
 
 // ── Inbound routing ────────────────────────────────────────────────────────

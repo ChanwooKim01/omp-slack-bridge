@@ -4,6 +4,8 @@ import * as path from "path";
 import type { ChallengeAuth } from "../auth/challenge.js";
 import type { ExternalMessage } from "../types/index.js";
 import { markdownToBlocks, splitMarkdownIntoMessages } from "./blocks.js";
+import { slackErrorCode } from "./errors.js";
+import type { ThreadMessage } from "./thread-history.js";
 
 /**
  * Options for file uploads via the Slack client.
@@ -42,31 +44,32 @@ async function loadSlackWebApi() {
 }
 
 /**
- * Errors from the Web API carry the machine-readable code in `data.error`; transport errors in `code`.
- */
-function slackErrorCode(error: unknown): string {
-  if (error && typeof error === "object") {
-    if ("data" in error && error.data && typeof error.data === "object" && "error" in error.data && error.data.error) {
-      return String(error.data.error);
-    }
-    if ("code" in error && error.code) return String(error.code);
-    if ("message" in error && error.message) return String(error.message);
-  }
-  return String(error);
-}
-
-/**
  * The slice of the Slack Web API this client calls. Typed structurally so Block Kit payloads built
  * elsewhere stay loosely typed; the real WebClient is cast to it once, where it is constructed.
  */
 interface SlackWebApi {
-  chat: { postMessage(args: Record<string, unknown>): Promise<{ ts?: string }> };
+  auth: { test(): Promise<{ user_id?: string; bot_id?: string }> };
+  chat: {
+    postMessage(args: Record<string, unknown>): Promise<{ ts?: string }>;
+    update(args: Record<string, unknown>): Promise<unknown>;
+  };
+  conversations: {
+    replies(args: Record<string, unknown>): Promise<{
+      messages?: ThreadMessage[];
+      has_more?: boolean;
+      response_metadata?: { next_cursor?: string };
+    }>;
+  };
   reactions: {
     add(args: { channel: string; timestamp: string; name: string }): Promise<unknown>;
     remove(args: { channel: string; timestamp: string; name: string }): Promise<unknown>;
   };
   files: { uploadV2(args: Record<string, unknown>): Promise<unknown> };
 }
+
+/** conversations.replies page size and the most pages one thread read follows (10,000 messages). */
+const THREAD_PAGE_SIZE = 200;
+const MAX_THREAD_PAGES = 50;
 
 // Fail-fast guard for the Socket Mode connect. The underlying @slack/socket-mode
 // client retries `apps.connections.open` with exponential backoff (retries: 100,
@@ -98,6 +101,7 @@ export class SlackClient {
   readonly type = "slack";
   private app: App | null = null;
   private web: Promise<SlackWebApi> | null = null;
+  private botIdentity: Promise<{ userId: string; botId?: string }> | null = null;
   private _isConnected = false;
   private botUserId: string = "";
   private messageHandler?: (message: ExternalMessage) => void;
@@ -473,6 +477,67 @@ export class SlackClient {
     } catch (error) {
       throw new Error(`Slack send failed: ${(error as Error).message}`);
     }
+  }
+
+  /** Who the bot token authenticates as (`auth.test`), looked up once: thread messages are classified by it. */
+  getBotIdentity(): Promise<{ userId: string; botId?: string }> {
+    this.botIdentity ??= this.getWebClient()
+      .then((web) => web.auth.test())
+      .then((result) => {
+        if (!result.user_id) throw new Error("Slack auth.test returned no bot user id");
+        return { userId: result.user_id, ...(result.bot_id ? { botId: result.bot_id } : {}) };
+      })
+      .catch((error: unknown) => {
+        this.botIdentity = null;
+        throw new Error(`Slack bot identity lookup failed: ${slackErrorCode(error)}`);
+      });
+    return this.botIdentity;
+  }
+
+  /**
+   * Messages of a thread, root first, oldest first (`conversations.replies`, all pages). With
+   * `rootOnly` only the root is requested.
+   */
+  async fetchThreadMessages(chatId: string, threadTs: string, options?: { rootOnly?: boolean }): Promise<ThreadMessage[]> {
+    const web = await this.getWebClient();
+    const messages: ThreadMessage[] = [];
+    try {
+      let cursor: string | undefined;
+      for (let page = 0; page < MAX_THREAD_PAGES; page++) {
+        const response = await web.conversations.replies({
+          channel: chatId,
+          ts: threadTs,
+          limit: options?.rootOnly ? 1 : THREAD_PAGE_SIZE,
+          ...(cursor ? { cursor } : {}),
+        });
+        messages.push(...(response.messages ?? []));
+        cursor = response.has_more ? response.response_metadata?.next_cursor || undefined : undefined;
+        if (options?.rootOnly || !cursor) return messages;
+      }
+      throw new Error(`thread has more than ${MAX_THREAD_PAGES * THREAD_PAGE_SIZE} messages`);
+    } catch (error) {
+      throw new Error(`Slack thread read failed: ${slackErrorCode(error)}`);
+    }
+  }
+
+  /** Replace the text of a message this bot posted. Blocks are replaced too: an update that omits them would keep the old ones. */
+  async updateMessage(chatId: string, ts: string, text: string): Promise<void> {
+    const web = await this.getWebClient();
+    try {
+      await web.chat.update({ channel: chatId, ts, text, blocks: markdownToBlocks(text) });
+    } catch (error) {
+      throw new Error(`Slack message update failed: ${slackErrorCode(error)}`);
+    }
+  }
+
+  /** Post one message into a thread and resolve with its ts. */
+  async postThreadReply(chatId: string, threadTs: string, text: string): Promise<string> {
+    let postedTs: string | undefined;
+    await this.sendMessageInThread(chatId, text, threadTs, undefined, (ts) => {
+      postedTs = ts;
+    });
+    if (!postedTs) throw new Error("Slack did not return a timestamp for the posted message");
+    return postedTs;
   }
 
   async sendTyping(_chatId: string): Promise<void> {

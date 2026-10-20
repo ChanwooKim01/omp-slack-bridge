@@ -16,6 +16,7 @@ Summarized featureset:
 - Switch between sessions, spawn new ones, and hand over the active terminal session to Slack
 - Session message replay - when resuming a session, prior conversation history is replayed into the Slack thread
 - Opt sessions out of automatically claiming the Slack connection
+- **Keep long threads short** — the bridge keeps each session thread to its latest interactions and replaces everything older with an agent-written summary at the top, so a phone gets to the newest message at once (see [Keeping threads short](#keeping-threads-short))
 
 ## About this fork
 
@@ -96,6 +97,60 @@ flowchart LR
 - The upstream tmux/Pi session-spawning commands are not the supported Windows/Paseo workflow; use Paseo to create and switch sessions.
 - Existing configured channel/user authorization is reused. File-transfer scopes are not enabled by this setup. Optional Slack user/channel metadata scopes are not required for text question replies.
 
+## Keeping threads short
+
+On a phone, a long thread takes a long time to scroll to its newest messages. The bridge keeps each session thread short: it holds on to the **latest interactions** and replaces everything older with an **agent-written summary at the top of the thread**.
+
+An **interaction** is one message of yours plus every bridge message that follows it, up to your next message. Bridge messages before your first message in a thread (for example a handover replay) count as the oldest interaction.
+
+### What happens
+
+1. After a turn that started in Slack has been answered in its thread, the session that owns the thread counts the thread's interactions. Below `threadPruneAt` (default **10**) nothing happens.
+2. At `threadPruneAt` or more, all but the newest `threadKeep` (default **5**) are summarized: the session's own model gets the stored summary and the text of those interactions, and writes a short Korean bullet list (about 1,200 characters at most) that merges both.
+3. The summary goes to the top of the thread. If the bridge posted the thread's root message, the root becomes `**<title>**`, a blank line, and `📝 지난 대화 요약` followed by the summary. If you started the thread yourself, your message is the root and a bot cannot edit it, so the bridge turns its own earliest reply in the thread into that header message instead (and never prunes it).
+4. Only then are the summarized messages deleted: the bridge's own with the bot token, yours with the [user token](#user-token-for-deleting-your-messages). The root and the newest `threadKeep` interactions are never deleted.
+
+The **title** is the one you set with `.bridge title`; otherwise it is the first line of the root message. A root you renamed by hand, such as `[VLM_Verifier] MoT`, keeps its text. The bridge's default root (`📁 **project** (branch) · path`) loses its emoji and markup.
+
+**Safety rules**
+
+- If the summary cannot be made (model unavailable, empty reply, a host without side turns) or the header cannot be written, **nothing is deleted**. If a deletion fails halfway, the rest stays for the next run.
+- Nothing is pruned while the session is working, while an `ask` question is waiting for your answer in that thread, or in a thread the session does not own. One thread is pruned at a time, and deletions are paced and retried on Slack's rate limit.
+- Without a user token nothing is pruned automatically; the bridge says so once in the terminal.
+- A user token that Slack rejects, or that belongs to someone other than the trusted Slack user, is detected before anything is summarized.
+- After an automatic prune failed, that thread is not tried again automatically for 5 minutes, so a broken setup does not cost a summary request on every turn. `.bridge new` is never held back.
+- The summarizer reads the **complete** text of every message that is deleted: a long message is split over several summary rounds, never shortened. If any round fails, nothing is deleted.
+- Every deletion checks the session again right before it is sent. If the session gets busy, is asked a question or the thread changes hands meanwhile, the run stops there and the rest waits for the next one.
+- `.bridge new` only touches messages up to the command itself: whatever you wrote after it stays and still reaches the agent. A ⏳ reaction on your command shows that it is working.
+
+### Commands
+
+Write them in the thread (`.bridge ...`) or, for the current session's thread, in the terminal (`/slk-bridge ...`). Replies to them are ordinary thread messages and are pruned later like the rest.
+
+| Command | Effect |
+| --- | --- |
+| `.bridge title <text>` | Set the thread's title and rewrite its header. Needs no user token. |
+| `.bridge new` | Prune now: summarize **every** interaction, then delete them all. The thread stays: header, then the bridge's one-line reply. Needs the user token. (`.bridge new <cwd>`, with a path, still starts a fresh tmux bridge session.) |
+| `.bridge keep <N>` | Keep the newest N interactions (1–50, default 5) in every thread. Also sets the threshold to `max(2N, N+1)` unless you set it afterwards. |
+| `.bridge pruneat <M>` | Prune once a thread holds M interactions. M must exceed the number kept; default 10. |
+
+Both settings are global and live in `slk-bridge.json` as `threadKeep` and `threadPruneAt`. `/slk-bridge status` shows them, and whether a user token makes automatic pruning possible.
+
+### What the summary costs
+
+The summary is one **side turn** of the session's own model (OMP's `ctx.runEphemeralTurn`). Neither the request nor the reply is added to the agent's conversation, and nothing is posted to Slack for it. A side turn sends the session's current conversation context along with the transcript, so a prune costs about **one extra request of that session** — usually served from the prompt cache, because it runs right after a turn. A long backlog (for example the first prune of an old thread, or `.bridge new`) is summarized in rounds of about 48,000 characters, one request per round. A prune runs once per `threadPruneAt − threadKeep` new interactions, not after every message. A host without side turns (for example upstream Pi) cannot summarize, so nothing is pruned there.
+
+### User token for deleting your messages
+
+Slack lets a bot delete only its own messages. Deleting **your** messages in the session threads needs a **user token** (`xoxp-...`) with the user scope `chat:write`:
+
+- **Manifest:** add `user: [chat:write]` under `oauth_config.scopes` (see the [manifest](#fast-way-create-the-app-from-a-manifest)), reinstall the app, and copy the **User OAuth Token**.
+- **Manually:** **OAuth & Permissions → User Token Scopes** → add `chat:write` → reinstall the app → copy the **User OAuth Token** at the top of that page.
+
+Give the token to the bridge as a third argument — `/slk-bridge configure <bot-token> <app-token> <user-token>` — in the menu's **Configure**, or with `PI_SLACK_USER_TOKEN` (never written to the file). Reconfiguring without a user token keeps the stored one. To switch pruning off, remove `userToken` from `slk-bridge.json` (and revoke the token in Slack).
+
+**Security.** In Slack's model a user token with `chat:write` can post and delete as you anywhere in the workspace; Slack cannot limit a token to one conversation. The bridge restricts it in code: a single module (`src/slack/guarded-delete.ts`) is the only code that reads the token. It can only call `chat.delete`, only in the paired DM, only for a reply of one of the bridge's own threads (never the thread root), and only for messages written by the token's own user, who must be the trusted Slack user. Anything else is refused before a request is sent. The token is stored in `slk-bridge.json` (mode `0600`, or the directory ACL on Windows) like the other tokens, so anyone who can read that file can use the token **outside** this bridge. Workspace admins may block user-scope installs or require approval for them. Without the token the rest of the bridge works unchanged.
+
 ## Setup
 
 ### 1. Install
@@ -144,6 +199,8 @@ You need a Slack app with **Socket Mode** and two tokens: a **Bot Token** (`xoxb
          - im:write
          - files:read
          - files:write
+       user:
+         - chat:write
    settings:
      event_subscriptions:
        bot_events:
@@ -156,6 +213,7 @@ You need a Slack app with **Socket Mode** and two tokens: a **Bot Token** (`xoxb
    ```
 
    You can rename `oh-my-pi`. Drop `files:read` / `files:write` if you never send files between Slack and the agent.
+   The `user: chat:write` scope is only for [deleting your own messages when threads are pruned](#keeping-threads-short); drop it if you do not want pruning.
 4. **App-Level Token.** In **Settings → Basic Information → App-Level Tokens**, click **Generate Token and Scopes**. Give it any name, add the scope `connections:write`, click **Generate**, and copy the `xapp-...` token.
 5. **Bot Token.** In **Settings → Install App**, click **Install to Workspace** → **Allow**. Copy the **Bot User OAuth Token** (`xoxb-...`).
 6. **Icon (optional).** In **Settings → Basic Information → Display Information**, upload [`media/icon-512.png`](media/icon-512.png) as the app icon.
@@ -171,7 +229,8 @@ If you prefer clicking through the settings, or you are fixing an existing app:
    - `message.channels` — public channels (only if you enable channels with `/enable`)
    - `message.groups` — private channels (same)
 4. **Features → OAuth & Permissions → Bot Token Scopes:** add the scopes from the table below.
-5. **Settings → Install App:** install (or **reinstall** after you changed scopes or events) and copy the `xoxb-...` token.
+   Optional, for [thread pruning](#keeping-threads-short): under **User Token Scopes** add `chat:write`.
+5. **Settings → Install App:** install (or **reinstall** after you changed scopes or events) and copy the `xoxb-...` token — and, if you added the user scope, the `xoxp-...` **User OAuth Token**.
 
 > After you change scopes or events, Slack shows a yellow "reinstall your app" banner. The change takes effect only after the reinstall.
 
@@ -191,6 +250,12 @@ If you prefer clicking through the settings, or you are fixing an existing app:
 | `im:read` | optional: DM metadata for session management (channel IDs starting with `D` are recognised without it) |
 | `users:read` | optional: show display names instead of user IDs |
 
+#### User Token scope (optional)
+
+| Scope (under **User Token Scopes**) | Needed for |
+| --- | --- |
+| `chat:write` | deleting *your own* messages from the session threads when [old interactions are pruned](#keeping-threads-short). Skip it if you do not want pruning. |
+
 ### 3. Give the tokens to the bridge
 
 Configure the Slack Bridge via the interactive menu:
@@ -200,12 +265,13 @@ Configure the Slack Bridge via the interactive menu:
 # Select "Configure"
 # Enter bot token
 # Enter app token
+# Enter user token (optional, enables thread pruning)
 ```
 
 Or via CLI:
 
 ```bash
-/slk-bridge configure <bot-token> <app-token>
+/slk-bridge configure <bot-token> <app-token> [user-token]
 ```
 
 Or set environment variables (never written to `slk-bridge.json`):
@@ -213,6 +279,7 @@ Or set environment variables (never written to `slk-bridge.json`):
 ```bash
 export PI_SLACK_BOT_TOKEN="xoxb-your-slack-bot-token"
 export PI_SLACK_APP_TOKEN="xapp-your-slack-app-token"
+export PI_SLACK_USER_TOKEN="xoxp-your-slack-user-token"   # optional, enables thread pruning
 ```
 
 ### 4. Connect
@@ -252,7 +319,7 @@ Only one `tmux` session can exist at time to function as a container for a newly
 
 There are several main commands introduced:
 
-- `/slk-bridge new [path]` - kill current Pi session and start a new one inside a tmux session. Include `path` as an optional argument to start the session in a path on your OS
+- `/slk-bridge new <path>` - kill current Pi session and start a new one inside a tmux session, started in `path` on your OS. Without a path, `/slk-bridge new` does something else: it clears the session's Slack thread (see [Keeping threads short](#keeping-threads-short)).
 - `/slk-bridge resume` - list the recent 10 sessions of your Pi agent.
 - `/slk-bridge resume list [number]` - list the recent `number` sessions (default 10). Include an optional `number` argument to list the last `number` sessions.
 - `/slk-bridge resume <number>` - resume a session denoted by the number in the `resume`/`resume list` output. The old tmux session (if it exists) gets used for switching the Pi terminal session.
@@ -267,6 +334,7 @@ Every joined session gets its own thread in the DM with the Slack App bridged to
 
 The user can use `.bridge` as a sort-of replacement to trigger some `/` commands to Pi. Currently only supports `skills` and `prompt templates` next to pi-slack-bridge native commands.
 To list all available commands, send `.` in Slack.
+`.bridge title <text>`, `.bridge new`, `.bridge keep <N>` and `.bridge pruneat <M>` keep a thread short; they are described under [Keeping threads short](#keeping-threads-short).
 
 ![dot commands screenshot](media/dot-commands-screenshot.png)
 
@@ -279,6 +347,7 @@ To list all available commands, send `.` in Slack.
 - Per-session inboxes (they hold the text of Slack messages): `~/.omp/agent/slk-bridge-inbox/`
 - Downloads: `~/.pi/slk-bridge-downloads/slack/`
 - Environment variables take precedence over file config and are never written back to the file
+- The optional Slack **user token** is stored in `slk-bridge.json` like the other tokens (`PI_SLACK_USER_TOKEN` is never written back) and is read by one module only, `src/slack/guarded-delete.ts`, which uses it solely to delete your own messages from this bridge's threads in the paired DM — see [User token for deleting your messages](#user-token-for-deleting-your-messages)
 - Config updates are locked across processes, re-read under the lock and replaced atomically (temp file + rename); a config file that does not parse is never overwritten
 - Challenge-based authentication (6-digit code, 3 attempts, 2-minute expiry)
 - Transport-namespaced user IDs prevent impersonation
@@ -311,6 +380,7 @@ Or set in config:
 - **`Refusing to overwrite ...: it is not valid JSON`** — `slk-bridge.json` was damaged or edited by hand. The bridge never overwrites a file it cannot parse; fix or restore the JSON.
 - **`Timed out waiting for the slk-bridge config lock`** — another process holds `slk-bridge.json.lock`. A lock older than 5 seconds is treated as left behind by a crash and broken automatically; if it persists with no `omp` running, delete the lock file.
 - **Handover not working** — ensure a trusted Slack user has already claimed the bridge, since `/slk-bridge handover` needs a remembered Slack DM target.
+- **Threads are not pruned** — pruning needs the user token (`/slk-bridge status` shows `Thread pruning: ... (off: no user token)` without it), a session that owns the thread, an idle session and no unanswered `ask` question; and it only starts once a thread holds `threadPruneAt` interactions. A summary that could not be made or written deletes nothing; the terminal shows why. If deleting fails with `cant_delete_message` or `missing_scope`, check that the user token belongs to the trusted Slack user and has the user scope `chat:write`, then reinstall the app.
 - **Handoff not working** — ensure tmux is installed and `pi` is in your PATH. Handoff spawns `pi --session <target>` in tmux.
 
 ## Development
@@ -339,7 +409,7 @@ pi -e src/bridge/index.ts
 npm run test
 ```
 
-Covers config loading and cross-process-safe updates, the router lock (including simultaneous claimants in separate processes), the session registry and inbox, inbound routing, outbound posting without a socket, two sessions sharing one DM end to end, Slack block splitting, conversation history extraction, and formatting. A few tests start real Node processes to exercise the file locks; they take a few seconds.
+Covers config loading and cross-process-safe updates, the router lock (including simultaneous claimants in separate processes), the session registry and inbox, inbound routing, outbound posting without a socket, two sessions sharing one DM end to end, Slack block splitting, conversation history extraction, and formatting. Thread pruning is covered from the grouping of a thread into interactions and the guarded deleter's refusals (other channel, other user, thread root, foreign thread) up to a whole bridge pruning an in-memory DM thread through a fake Slack API. A few tests start real Node processes to exercise the file locks; they take a few seconds.
 
 ## Acknowledgements
 

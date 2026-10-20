@@ -134,6 +134,11 @@ export function installPaseoQuestions(pi: ExtensionAPI, send: (text: string, tar
   pi.registerTool(definition);
 
   return {
+    /** A question is waiting for its answer in this thread, or its alert is still being posted (so its thread is not known yet). */
+    isPending(chatId: string, threadId: string): boolean {
+      if (!pending) return false;
+      return !pending.target || (pending.target.chatId === chatId && pending.target.threadId === threadId);
+    },
     async receive(message: ExternalMessage): Promise<boolean> {
       const item = pending;
       const answersPending = item?.target && message.chatId === item.target.chatId && message.threadId === item.target.threadId

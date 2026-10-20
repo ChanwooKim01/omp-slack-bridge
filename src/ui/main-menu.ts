@@ -6,6 +6,7 @@
  */
 
 import { buildBridgeHelpText } from "../bridge/commands.js";
+import { looksLikeUserToken } from "../bridge/thread-settings.js";
 import { updateConfig } from "../config/index.js";
 
 // ── Types ───────────────────────────────────────────────────────────────────
@@ -62,9 +63,16 @@ async function doConfigure(mctx: MenuContext): Promise<void> {
   if (!botToken) return;
   const appToken = await mctx.ui.input("Slack app token (xapp-...)");
   if (!appToken) return;
+  const userToken = (await mctx.ui.input("Slack user token (xoxp-..., optional: enables thread pruning)"))?.trim();
+  if (userToken && !looksLikeUserToken(userToken)) {
+    mctx.ui.notify("❌ The user token must be a Slack user token (xoxp-...), not a bot or app token", "error");
+    return;
+  }
 
+  // Skipping the user token keeps the stored one: dropping it would silently turn pruning off.
   updateConfig((config) => {
-    config.slack = { botToken, appToken };
+    const keptUserToken = userToken || config.slack?.userToken;
+    config.slack = { botToken, appToken, ...(keptUserToken ? { userToken: keptUserToken } : {}) };
   });
 
   try {

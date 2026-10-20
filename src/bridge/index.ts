@@ -19,6 +19,10 @@
  *   util/atomic-write.ts — Atomic file replacement and synchronous sleep
  *   types/index.ts    — Shared type definitions
  *   bridge/commands.ts — Shared command definitions (status text, help text, remote command list)
+ *   bridge/thread-pruner.ts — Keeps session threads short: old interactions are summarized into the thread header, then deleted
+ *   bridge/thread-settings.ts — threadKeep / threadPruneAt and the commands that change them
+ *   slack/thread-history.ts — Interactions of a thread, prune selection, summary prompt, title and header text
+ *   slack/guarded-delete.ts — The only place the user token is used: chat.delete restricted to this bridge's threads in the paired DM
  *   ui/main-menu.ts   — Interactive TUI main menu
  *   ui/status-widget.ts — Status widget
  */
@@ -56,16 +60,20 @@ import {
   extractTextFromMessage,
   formatToolCalls,
 } from "../slack/formatting.js";
+import { createBotTokenDeleter, createUserTokenDeleter, type GuardedDeleter } from "../slack/guarded-delete.js";
 import {
   decideInboundRoute,
   getRememberedSlackThreadForCurrentSession,
+  getSlackThreadMeta,
   getSlackThreadOwnerSession,
   hasLatestAssistantBeenDeliveredToSlackThread,
   isExplicitRemoteResumeCommand,
   markLatestAssistantDeliveredToSlackThread,
   rememberSlackThreadForSession,
   SESSION_OFFLINE_NOTICE,
+  updateSlackThreadMeta,
 } from "../slack/routing.js";
+import { normalizeTitle, slackTsFromMs } from "../slack/thread-history.js";
 import type { ExternalMessage, PendingRemoteChat } from "../types/index.js";
 import { openMainMenu } from "../ui/main-menu.js";
 import { createStatusWidget } from "../ui/status-widget.js";
@@ -76,6 +84,20 @@ import {
   buildRemoteCommandList,
 } from "./commands.js";
 import { installPaseoQuestions } from "./paseo-questions.js";
+import {
+  type CommandReply,
+  createThreadPruner,
+  describePruneOutcome,
+  type PruneBlocker,
+  type ThreadRef,
+} from "./thread-pruner.js";
+import {
+  type CommandPrefix,
+  looksLikeUserToken,
+  resolvePruneSettings,
+  runKeepCommand,
+  runPruneAtCommand,
+} from "./thread-settings.js";
 
 /** Cadence of the three checks every joined session runs. */
 const OWNERSHIP_CHECK_MS = 250;
@@ -89,6 +111,15 @@ const MAX_CLAIM_BACKOFF_MS = 60_000;
 const NOTICE_REPEAT_MS = 60_000;
 /** Inbox messages remembered for de-duplication by chat:ts. */
 const SEEN_INBOX_LIMIT = 4096;
+/** A summary side turn is abandoned after this long. */
+const SUMMARY_TIMEOUT_MS = 180_000;
+
+/** The part of OMP's extension context that runs a side turn (`ctx.runEphemeralTurn`); other hosts do not have it. */
+interface SideTurnContext {
+  runEphemeralTurn?: (options: { promptText: string; signal?: AbortSignal }) => Promise<{ replyText: string }>;
+}
+
+const NO_THREAD_REPLY: CommandReply = { ok: false, text: "❌ 이 세션에는 아직 Slack 스레드가 없습니다." };
 
 /** Wait for `work`, but never longer than `ms`; a failure of `work` is ignored. */
 async function settleWithin(work: Promise<unknown>, ms: number): Promise<void> {
@@ -536,13 +567,15 @@ export default function (pi: ExtensionAPI): void {
 
   function bridgeStatus(): BridgeStatus {
     const stats = auth.getStats();
+    const config = loadConfig();
     return {
       joined: isJoined(),
       router: routerRole(),
       socketOpen: slackIsConnected(),
-      autoConnect: loadConfig().autoConnect !== false,
+      autoConnect: config.autoConnect !== false,
       trustedUser: stats.trustedUser,
       channels: stats.channels,
+      threadPruning: { ...resolvePruneSettings(config), userToken: Boolean(config.slack?.userToken) },
     };
   }
 
@@ -1032,13 +1065,35 @@ export default function (pi: ExtensionAPI): void {
           await sendRemoteText(message, "🔌 Left the Slack bridge. Run /slk-bridge connect in this session to rejoin.");
           await leaveCurrentSession();
           return true;
-        case "new":
+        case "new": {
+          if (!rest) {
+            // Without a path, `new` clears this thread: summarize its history, delete it, then answer.
+            // Only messages up to this command are pruned: later ones are still on their way to the agent.
+            // The ⏳ reaction on the command shows that work is going on; it goes away with the message.
+            const reply = await runNewCommand(threadRefOf(message), message.messageId, async () => {
+              await getSlackClient()?.addReaction(message.chatId, message.messageId, "hourglass_flowing_sand").catch(() => undefined);
+            });
+            await getSlackClient()?.removeReaction(message.chatId, message.messageId, "hourglass_flowing_sand").catch(() => undefined);
+            // The answer is a thread message like any other, so a later prune can remove it too.
+            await sendRemoteText(message, reply.text);
+            return true;
+          }
           try {
-            const summary = await startFreshBridgeSession(rest || undefined);
+            const summary = await startFreshBridgeSession(rest);
             await sendRemoteText(message, summary);
           } catch (err) {
             await sendRemoteText(message, `❌ Failed to start fresh bridge session: ${(err as Error).message}`);
           }
+          return true;
+        }
+        case "title":
+          await sendRemoteText(message, (await runTitleCommand(threadRefOf(message), rest, ".bridge")).text);
+          return true;
+        case "keep":
+          await sendRemoteText(message, runKeepCommand(rest, ".bridge").text);
+          return true;
+        case "pruneat":
+          await sendRemoteText(message, runPruneAtCommand(rest, ".bridge").text);
           return true;
         case "resume": {
           if (!rest) {
@@ -1117,6 +1172,149 @@ export default function (pi: ExtensionAPI): void {
     }
 
     return false;
+  }
+
+  // ── Thread pruning ───────────────────────────────────────────────────────
+  //
+  // A session thread keeps only its newest interactions: older ones are summarized into the thread's
+  // header and deleted (bridge/thread-pruner.ts). It runs here, in the session that owns the thread,
+  // once a Slack-originated turn has been flushed to it. The deletions are the only use of the user
+  // token and go through slack/guarded-delete.ts.
+
+  function trustedUserId(): string | undefined {
+    return (loadConfig().auth ?? auth.exportConfig()).trustedUser?.split(":")[0];
+  }
+
+  let botDeleterCache: { token: string; deleter: GuardedDeleter } | undefined;
+  let userDeleterCache: { token: string; deleter: GuardedDeleter } | undefined;
+
+  /** Deletes the bridge's own messages with the bot token; rebuilt only when the stored token changes. */
+  function botDeleter(): GuardedDeleter | undefined {
+    const token = loadConfig().slack?.botToken;
+    if (!token) return undefined;
+    if (botDeleterCache?.token !== token) {
+      botDeleterCache = {
+        token,
+        deleter: createBotTokenDeleter({ botToken: token, getPairedChatId: notificationChatId, getTrustedUserId: trustedUserId }),
+      };
+    }
+    return botDeleterCache.deleter;
+  }
+
+  /** Deletes the trusted user's own messages; undefined without a user token, which switches pruning off. */
+  function userDeleter(): GuardedDeleter | undefined {
+    const token = loadConfig().slack?.userToken;
+    if (!token) return undefined;
+    if (userDeleterCache?.token !== token) {
+      userDeleterCache = {
+        token,
+        deleter: createUserTokenDeleter({ userToken: token, getPairedChatId: notificationChatId, getTrustedUserId: trustedUserId }),
+      };
+    }
+    return userDeleterCache.deleter;
+  }
+
+  /**
+   * The summary is a side turn of the session's own model (OMP `ctx.runEphemeralTurn`): the request
+   * and the reply are not added to the session history, so the agent's conversation stays as it was,
+   * and nothing is posted to Slack for it. Without that API the summary fails and nothing is deleted.
+   */
+  async function summarizeWithSideTurn(prompt: string): Promise<string> {
+    const host = ctx as unknown as SideTurnContext;
+    if (!host.runEphemeralTurn) {
+      throw new Error("이 OMP 버전은 side turn(ctx.runEphemeralTurn)을 지원하지 않습니다");
+    }
+    const { replyText } = await host.runEphemeralTurn({ promptText: prompt, signal: AbortSignal.timeout(SUMMARY_TIMEOUT_MS) });
+    return replyText;
+  }
+
+  /** Why this thread must not be pruned right now: not ours, the session mid-turn, or a question unanswered. */
+  function pruneBlocker(ref: ThreadRef): PruneBlocker | undefined {
+    if (!canPost()) return "not-joined";
+    if (getSlackThreadOwnerSession(ref.chatId, ref.threadTs) !== getCurrentSessionFile()) return "not-owner";
+    let idle: boolean;
+    try {
+      idle = ctx.isIdle();
+    } catch {
+      return "not-joined"; // the session context is gone
+    }
+    if (handoverPending || pendingRemoteChat || !idle) return "busy";
+    return questions.isPending(ref.chatId, ref.threadTs) ? "question-pending" : undefined;
+  }
+
+  const pruner = createThreadPruner({
+    slack: getSlackClient,
+    botDeleter,
+    userDeleter,
+    getMeta: (ref) => getSlackThreadMeta(ref.chatId, ref.threadTs),
+    updateMeta: (ref, patch) => {
+      updateSlackThreadMeta(ref.chatId, ref.threadTs, patch);
+    },
+    settings: () => resolvePruneSettings(loadConfig()),
+    trustedUserId,
+    summarize: summarizeWithSideTurn,
+    blocker: pruneBlocker,
+    report: notify,
+  });
+
+  /**
+   * After a Slack-originated turn was flushed: prune the thread in the background if it grew long.
+   * Messages after the one this turn answered (`upToTs`) may not have reached the session yet, so they stay.
+   */
+  function scheduleAutoPrune(ref: ThreadRef, upToTs: string): void {
+    if (!currentMembership()) return;
+    runInBackground(async () => {
+      const outcome = await pruner.autoPrune(ref, { upToTs });
+      if (outcome.status === "pruned") {
+        notify(describePruneOutcome(outcome).text, "info");
+      } else if (outcome.status === "failed") {
+        notifyRepeating(`prune-${outcome.stage}`, `Slack 스레드 자동 정리 · ${describePruneOutcome(outcome).text}`, "warning");
+      }
+    });
+  }
+
+  /** The thread a Slack message was written in. */
+  function threadRefOf(message: ExternalMessage): ThreadRef | undefined {
+    return message.threadId ? { chatId: message.chatId, threadTs: message.threadId } : undefined;
+  }
+
+  /** The thread a terminal command acts on: the current session's thread in the paired DM. */
+  function currentThreadRef(): ThreadRef | undefined {
+    const chatId = notificationChatId();
+    const threadTs = chatId ? resolveThreadId(chatId) : undefined;
+    return chatId && threadTs ? { chatId, threadTs } : undefined;
+  }
+
+  /**
+   * `new`: summarize the thread's history up to `upToTs` and delete it. `onStart` runs once the work
+   * really begins.
+   */
+  async function runNewCommand(
+    ref: ThreadRef | undefined,
+    upToTs: string,
+    onStart: () => void | Promise<void>,
+  ): Promise<CommandReply> {
+    if (!ref) return NO_THREAD_REPLY;
+    // Check the preconditions first, so the "working on it" signal only appears when work starts.
+    if (!userDeleter()) return describePruneOutcome({ status: "skipped", reason: "no-user-token" });
+    const blocker = pruneBlocker(ref);
+    if (blocker) return describePruneOutcome({ status: "skipped", reason: `blocked:${blocker}` });
+    await onStart();
+    return describePruneOutcome(await pruner.pruneAll(ref, { upToTs }));
+  }
+
+  /** `title <text>`: store the title and rewrite the thread's header with it. */
+  async function runTitleCommand(ref: ThreadRef | undefined, title: string, prefix: CommandPrefix): Promise<CommandReply> {
+    if (!ref) return NO_THREAD_REPLY;
+    const wanted = normalizeTitle(title);
+    if (!wanted) {
+      const current = getSlackThreadMeta(ref.chatId, ref.threadTs)?.title;
+      return { ok: true, text: `제목: ${current ?? "(아직 없음)"}\n바꾸려면 \`${prefix} title <제목>\`` };
+    }
+    const outcome = await pruner.setTitle(ref, wanted);
+    return outcome.status === "updated"
+      ? { ok: true, text: `✏️ 스레드 제목을 "${wanted}"(으)로 바꿨습니다.` }
+      : { ok: false, text: `❌ 제목을 바꾸지 못했습니다: ${outcome.error}` };
   }
 
   // ── Widget ───────────────────────────────────────────────────────────────
@@ -1208,7 +1406,8 @@ export default function (pi: ExtensionAPI): void {
     if (!tokens?.botToken || !tokens.appToken) {
       throw new Error("Slack not configured. Run /slk-bridge configure first");
     }
-    await replaceSlackClient(new SlackClient(tokens, auth));
+    // Only the bot and app tokens reach the client; the user token is handled by guarded-delete.ts alone.
+    await replaceSlackClient(new SlackClient({ botToken: tokens.botToken, appToken: tokens.appToken }, auth));
     return joinCurrentSession({ postRoot: true, claim: "vacant" });
   }
 
@@ -1241,7 +1440,9 @@ export default function (pi: ExtensionAPI): void {
     // Every session with tokens gets a client: posting needs only the bot token. The socket opens
     // later, and only in the router.
     await replaceSlackClient(
-      config.slack?.botToken && config.slack?.appToken ? new SlackClient(config.slack, auth) : null,
+      config.slack?.botToken && config.slack?.appToken
+        ? new SlackClient({ botToken: config.slack.botToken, appToken: config.slack.appToken }, auth)
+        : null,
     );
 
     // Rejoin a session that joined before. Non-blocking by design: session_start is awaited by the
@@ -1344,9 +1545,13 @@ export default function (pi: ExtensionAPI): void {
    * 1. Slack-originated message: flush accumulated turns to the existing Slack thread
    * 2. Terminal handover: send conversation history + final response to a new Slack thread
    */
-  pi.on("agent_end", async (event, _context) => {
+  pi.on("agent_end", async (event, context) => {
+    ctx = context;
+    // The thread this turn's answer was flushed to: once the flush is done, a long thread is pruned.
+    let flushedThread: { ref: ThreadRef; upToTs: string } | undefined;
     // Branch 1: Message originated from Slack — flush accumulated turns
     if (pendingRemoteChat && canPost()) {
+      const remoteChat = pendingRemoteChat;
       try {
         const totalEntries = turnAccumulator?.entries.length ?? 0;
         let lastSlackThreadId = turnAccumulator?.threadId;
@@ -1375,6 +1580,13 @@ export default function (pi: ExtensionAPI): void {
             getCurrentSessionFile,
             () => getLastAssistantMessageInfo(ctx.sessionManager),
           );
+        }
+        const flushedThreadTs = lastSlackThreadId ?? remoteChat.threadId;
+        if (flushedThreadTs) {
+          flushedThread = {
+            ref: { chatId: turnAccumulator?.chatId ?? remoteChat.chatId, threadTs: flushedThreadTs },
+            upToTs: remoteChat.messageId,
+          };
         }
       } catch (err) {
         ctx.ui.notify(`Failed to send accumulated response: ${(err as Error).message}`, "error");
@@ -1436,6 +1648,8 @@ export default function (pi: ExtensionAPI): void {
     // Common state cleanup
     pendingRemoteChat = null;
     turnAccumulator = null;
+
+    if (flushedThread) scheduleAutoPrune(flushedThread.ref, flushedThread.upToTs);
   });
 
   pi.on("session_shutdown", async (_event, _context) => {
@@ -1529,14 +1743,21 @@ export default function (pi: ExtensionAPI): void {
         case "configure": {
           const botToken = parts[1];
           const appToken = parts[2];
+          const userToken = parts[3];
 
           if (!botToken || !appToken) {
-            context.ui.notify("Usage: /slk-bridge configure <bot-token> <app-token>", "error");
+            context.ui.notify("Usage: /slk-bridge configure <bot-token> <app-token> [user-token]", "error");
+            return;
+          }
+          if (userToken && !looksLikeUserToken(userToken)) {
+            context.ui.notify("❌ The user token must be a Slack user token (xoxp-...), not a bot or app token", "error");
             return;
           }
 
+          // A reconfigure without a user token keeps the stored one: dropping it would silently turn pruning off.
           updateConfig((config) => {
-            config.slack = { botToken, appToken };
+            const keptUserToken = userToken ?? config.slack?.userToken;
+            config.slack = { botToken, appToken, ...(keptUserToken ? { userToken: keptUserToken } : {}) };
           });
 
           try {
@@ -1561,8 +1782,17 @@ export default function (pi: ExtensionAPI): void {
 
         case "new": {
           const cwdArg = parts.slice(1).join(" ").trim();
+          if (!cwdArg) {
+            // Without a path, `new` clears this session's Slack thread: summarize it, then delete it.
+            // The Slack-ts equivalent of now: only history up to this command is pruned.
+            const reply = await runNewCommand(currentThreadRef(), slackTsFromMs(Date.now()), () => {
+              context.ui.notify("🧹 이전 대화를 요약하고 정리합니다…", "info");
+            });
+            context.ui.notify(reply.text, reply.ok ? "info" : "error");
+            break;
+          }
           try {
-            const summary = await startFreshBridgeSession(cwdArg || undefined);
+            const summary = await startFreshBridgeSession(cwdArg);
             context.ui.notify(summary, "info");
           } catch (err) {
             context.ui.notify(`❌ Failed to start fresh bridge session: ${(err as Error).message}`, "error");
@@ -1656,6 +1886,24 @@ export default function (pi: ExtensionAPI): void {
             lines.push(`  • ${s}`);
           }
           context.ui.notify(lines.join("\n"), "info");
+          break;
+        }
+
+        case "title": {
+          const reply = await runTitleCommand(currentThreadRef(), parts.slice(1).join(" "), "/slk-bridge");
+          context.ui.notify(reply.text, reply.ok ? "info" : "error");
+          break;
+        }
+
+        case "keep": {
+          const reply = runKeepCommand(parts.slice(1).join(" "), "/slk-bridge");
+          context.ui.notify(reply.text, reply.ok ? "info" : "error");
+          break;
+        }
+
+        case "pruneat": {
+          const reply = runPruneAtCommand(parts.slice(1).join(" "), "/slk-bridge");
+          context.ui.notify(reply.text, reply.ok ? "info" : "error");
           break;
         }
 

@@ -16,6 +16,7 @@
 - 세션을 전환하고, 새 세션을 만들고, 활성 터미널 세션을 Slack으로 넘깁니다(핸드오버, handover).
 - 세션 메시지 리플레이(replay): 세션을 재개하면 이전 대화 기록을 Slack 스레드에 다시 게시합니다.
 - 세션이 Slack 연결을 자동으로 차지하지 않도록 제외할 수 있습니다(opt-out).
+- **긴 스레드를 짧게 유지합니다.** 세션 스레드마다 최근 대화만 남기고, 더 오래된 내용은 에이전트가 쓴 요약으로 바꿔 스레드 맨 위에 둡니다. 그래서 휴대폰에서도 최신 메시지가 바로 보입니다. ([스레드 짧게 유지하기](#스레드-짧게-유지하기) 참고)
 
 ## 이 포크에 대하여
 
@@ -96,6 +97,60 @@ flowchart LR
 - 업스트림의 tmux/Pi 세션 생성 명령은 지원하는 Windows/Paseo 워크플로가 아닙니다. 세션을 만들고 전환할 때는 Paseo를 사용하세요.
 - 이미 설정된 채널/사용자 인가(authorization)를 그대로 재사용합니다. 이 설정이 파일 전송 스코프(scope, Slack 앱에 부여하는 권한 범위)를 활성화하지는 않습니다. 선택 사항인 Slack 사용자/채널 메타데이터 스코프는 텍스트로 질문에 답하는 데 필요하지 않습니다.
 
+## 스레드 짧게 유지하기
+
+휴대폰에서는 긴 스레드를 최신 메시지까지 스크롤하는 데 시간이 오래 걸립니다. 브리지는 세션 스레드를 짧게 유지합니다. **최근 상호작용(interaction)**만 남기고, 그보다 오래된 내용은 **에이전트가 쓴 요약**으로 바꿔 **스레드 맨 위**에 둡니다.
+
+**상호작용**은 내 메시지 하나와, 내 다음 메시지가 올 때까지 그 뒤에 이어지는 브리지 메시지 전부를 합친 단위입니다. 스레드에서 내 첫 메시지보다 앞에 있는 브리지 메시지(예: 핸드오버 리플레이)는 가장 오래된 상호작용으로 셉니다.
+
+### 동작 방식
+
+1. Slack에서 시작한 턴의 답변이 스레드에 모두 게시되면, 그 스레드를 소유한 세션이 스레드의 상호작용 수를 셉니다. `threadPruneAt`(기본값 **10**)개보다 적으면 아무 일도 하지 않습니다.
+2. `threadPruneAt`개 이상이면 가장 최근 `threadKeep`(기본값 **5**)개를 뺀 나머지를 요약합니다. 세션이 쓰는 모델에 저장된 기존 요약과 그 상호작용들의 텍스트를 주면, 둘을 합친 짧은 한국어 불릿 목록(최대 약 1,200자)을 만들어 줍니다.
+3. 요약은 스레드 맨 위에 둡니다. 브리지가 루트 메시지를 게시한 스레드라면 루트가 `**<제목>**`, 빈 줄, `📝 지난 대화 요약`, 요약 순서로 바뀝니다. 내가 직접 시작한 스레드라면 내 메시지가 루트이고 봇은 이를 수정할 수 없습니다. 이때는 브리지가 그 스레드에서 가장 먼저 보낸 자기 답장을 머리글 메시지로 바꿔 씁니다(이 메시지는 정리하지 않습니다).
+4. 그런 다음에야 요약한 메시지를 삭제합니다. 브리지가 보낸 메시지는 봇 토큰으로, 내 메시지는 [user token](#내-메시지-삭제를-위한-user-token)으로 지웁니다. 루트 메시지와 최근 `threadKeep`개 상호작용은 절대 삭제하지 않습니다.
+
+**제목**은 `.bridge title`로 정한 값입니다. 정하지 않았다면 루트 메시지의 첫 줄을 씁니다. `[VLM_Verifier] MoT`처럼 직접 바꿔 둔 루트 텍스트는 그대로 유지합니다. 브리지의 기본 루트(`📁 **project** (branch) · path`)는 이모지와 마크다운 기호를 뗍니다.
+
+**안전 규칙**
+
+- 요약을 만들지 못하거나(모델을 쓸 수 없음, 빈 응답, side turn을 지원하지 않는 호스트) 머리글을 쓰지 못하면 **아무것도 삭제하지 않습니다.** 삭제가 중간에 실패하면 나머지는 다음 실행 때까지 그대로 남습니다.
+- 세션이 작업 중일 때, 그 스레드에서 `ask` 질문이 내 답변을 기다리고 있을 때, 세션이 소유하지 않은 스레드에서는 정리하지 않습니다. 스레드는 한 번에 하나씩 정리하며, 삭제는 간격을 두고 실행하고 Slack 속도 제한(rate limit)에 걸리면 다시 시도합니다.
+- user token이 없으면 자동 정리를 하지 않습니다. 이 사실은 터미널에 한 번만 알립니다.
+- Slack이 거부하는 user token이나 신뢰된 Slack 사용자가 아닌 사람의 user token은 요약을 만들기 전에 알아냅니다.
+- 자동 정리가 실패하면 그 스레드는 5분 동안 자동으로 다시 시도하지 않습니다. 설정이 잘못된 채로 턴마다 요약 요청 비용이 드는 일을 막기 위해서입니다. `.bridge new`는 막지 않습니다.
+- 요약 모델은 삭제할 모든 메시지의 **전체** 텍스트를 읽습니다. 긴 메시지는 줄이지 않고 여러 요약 단계로 나눠서 읽습니다. 한 단계라도 실패하면 아무것도 삭제하지 않습니다.
+- 삭제 요청마다 보내기 직전에 세션 상태를 다시 확인합니다. 그 사이 세션이 작업을 시작하거나, 질문이 생기거나, 스레드의 소유 세션이 바뀌면 거기서 멈추고 나머지는 다음 정리 때 처리합니다.
+- `.bridge new`는 명령 메시지까지의 내용만 정리합니다. 명령 뒤에 보낸 메시지는 그대로 남고 에이전트에게도 전달됩니다. 작업 중에는 내 명령 메시지에 ⏳ 리액션이 붙습니다.
+
+### 명령
+
+스레드에서는 `.bridge ...`로, 터미널에서는 현재 세션의 스레드에 대해 `/slk-bridge ...`로 실행합니다. 이 명령에 대한 답장도 일반 스레드 메시지이므로 나중에 다른 메시지처럼 정리됩니다.
+
+| 명령 | 효과 |
+| --- | --- |
+| `.bridge title <text>` | 스레드 제목을 정하고 머리글을 다시 씁니다. user token이 필요 없습니다. |
+| `.bridge new` | 지금 정리합니다. **모든** 상호작용을 요약한 뒤 전부 삭제합니다. 스레드는 남습니다. 머리글과 브리지의 한 줄 답장만 보입니다. user token이 필요합니다. (경로를 붙인 `.bridge new <cwd>`는 이전처럼 새 tmux 브리지 세션을 시작합니다.) |
+| `.bridge keep <N>` | 모든 스레드에서 최근 N개 상호작용을 남깁니다(1–50, 기본값 5). 이후에 따로 정하지 않으면 정리 시작 개수도 `max(2N, N+1)`로 바뀝니다. |
+| `.bridge pruneat <M>` | 스레드의 상호작용이 M개가 되면 정리합니다. M은 남기는 개수보다 커야 합니다. 기본값은 10입니다. |
+
+두 설정은 전역 설정이며 `slk-bridge.json`에 `threadKeep`, `threadPruneAt`으로 저장됩니다. `/slk-bridge status`는 이 값과, user token 때문에 자동 정리가 가능한지를 보여 줍니다.
+
+### 요약에 드는 비용
+
+요약은 세션이 쓰는 모델의 **side turn**(OMP의 `ctx.runEphemeralTurn`) 한 번으로 만듭니다. 요청과 응답은 에이전트의 대화에 추가되지 않으며, 요약 때문에 Slack에 게시되는 것도 없습니다. side turn은 기록(transcript)과 함께 세션의 현재 대화 컨텍스트도 모델에 보냅니다. 따라서 정리 한 번에 **그 세션의 요청 한 번 정도**의 비용이 듭니다. 턴 직후에 실행하므로 대개 프롬프트 캐시(prompt cache)에서 처리됩니다. 오래된 스레드를 처음 정리하거나 `.bridge new`를 쓰는 것처럼 내용이 많으면 약 48,000자씩 나눠서 요약하며, 나눈 횟수만큼 요청합니다. 정리는 메시지마다가 아니라 새 상호작용이 `threadPruneAt − threadKeep`개 쌓일 때마다 한 번 일어납니다. side turn이 없는 호스트(예: 업스트림 Pi)는 요약을 만들 수 없으므로 정리하지 않습니다.
+
+### 내 메시지 삭제를 위한 user token
+
+Slack에서 봇은 자기 메시지만 삭제할 수 있습니다. 세션 스레드에서 **내** 메시지를 삭제하려면 사용자 스코프 `chat:write`가 있는 **user token**(`xoxp-...`)이 필요합니다.
+
+- **매니페스트:** `oauth_config.scopes` 아래에 `user: [chat:write]`를 추가하고([매니페스트](#빠른-방법-매니페스트로-앱-만들기) 참고) 앱을 다시 설치한 뒤 **User OAuth Token**을 복사합니다.
+- **수동:** **OAuth & Permissions → User Token Scopes**에서 `chat:write`를 추가하고, 앱을 다시 설치한 뒤, 그 페이지 위쪽의 **User OAuth Token**을 복사합니다.
+
+토큰은 브리지에 세 번째 인자로 전달합니다. `/slk-bridge configure <bot-token> <app-token> <user-token>`을 쓰거나 메뉴의 **Configure**에 입력하거나 `PI_SLACK_USER_TOKEN`을 설정합니다(환경 변수는 파일에 기록되지 않습니다). user token 없이 다시 설정해도 저장된 토큰은 유지됩니다. 정리를 끄려면 `slk-bridge.json`에서 `userToken`을 지우고 Slack에서 그 토큰을 폐기하세요.
+
+**보안.** Slack의 권한 모델에서 `chat:write` user token은 워크스페이스 어디서든 나를 대신해 메시지를 게시하고 삭제할 수 있습니다. Slack은 토큰을 대화 하나로 제한하는 기능이 없습니다. 그래서 브리지가 코드에서 제한합니다. 모듈 하나(`src/slack/guarded-delete.ts`)만 이 토큰을 읽습니다. 이 모듈은 `chat.delete`만 호출할 수 있고, 페어링된 DM 안에서, 브리지 자신의 스레드에 달린 답글에 대해서만(스레드 루트는 절대 안 됨), 토큰 주인이 직접 쓴 메시지에 대해서만 삭제합니다. 토큰 주인은 신뢰된 Slack 사용자여야 합니다. 이 조건에 하나라도 맞지 않으면 요청을 보내기 전에 거부합니다. 토큰은 다른 토큰들처럼 `slk-bridge.json`에 저장됩니다(권한 `0600`, Windows에서는 디렉터리 ACL). 따라서 이 파일을 읽을 수 있는 사람은 이 브리지 **밖에서도** 이 토큰을 쓸 수 있습니다. 워크스페이스 관리자가 user 스코프 설치를 막거나 승인을 요구할 수도 있습니다. 토큰이 없어도 브리지의 나머지 기능은 그대로 동작합니다.
+
 ## 설치 및 설정
 
 ### 1. 설치
@@ -144,6 +199,8 @@ OMP에서는 다음 순서로 설치합니다. 먼저 이 포크를 `~/.omp/agen
          - im:write
          - files:read
          - files:write
+       user:
+         - chat:write
    settings:
      event_subscriptions:
        bot_events:
@@ -156,6 +213,7 @@ OMP에서는 다음 순서로 설치합니다. 먼저 이 포크를 `~/.omp/agen
    ```
 
    `oh-my-pi`는 이름을 바꿔도 됩니다. Slack과 에이전트 사이에서 파일을 전혀 주고받지 않는다면 `files:read` / `files:write`를 빼세요.
+   `user: chat:write` 스코프는 [스레드를 정리할 때 내 메시지를 삭제하는 데](#스레드-짧게-유지하기)만 쓰입니다. 정리 기능이 필요 없다면 빼세요.
 4. **App-Level Token.** **Settings → Basic Information → App-Level Tokens**에서 **Generate Token and Scopes**를 클릭합니다. 이름은 아무거나 정해도 됩니다. 스코프 `connections:write`를 추가하고 **Generate**를 클릭한 뒤, `xapp-...` 토큰을 복사합니다.
 5. **Bot Token.** **Settings → Install App**에서 **Install to Workspace** → **Allow** 순서로 클릭합니다. **Bot User OAuth Token**(`xoxb-...`)을 복사합니다.
 6. **아이콘(선택 사항).** **Settings → Basic Information → Display Information**에서 [`media/icon-512.png`](media/icon-512.png)를 앱 아이콘으로 업로드합니다.
@@ -171,7 +229,8 @@ OMP에서는 다음 순서로 설치합니다. 먼저 이 포크를 `~/.omp/agen
    - `message.channels` — 공개 채널(`/enable`로 채널을 활성화하는 경우에만)
    - `message.groups` — 비공개 채널(조건은 위와 같음)
 4. **Features → OAuth & Permissions → Bot Token Scopes:** 아래 표의 스코프를 추가합니다.
-5. **Settings → Install App:** 앱을 설치합니다. 스코프나 이벤트를 바꾼 뒤에는 **다시 설치**합니다. 그리고 `xoxb-...` 토큰을 복사합니다.
+   선택 사항, [스레드 정리](#스레드-짧게-유지하기)용: **User Token Scopes** 아래에 `chat:write`를 추가합니다.
+5. **Settings → Install App:** 앱을 설치합니다. 스코프나 이벤트를 바꾼 뒤에는 **다시 설치**합니다. 그리고 `xoxb-...` 토큰을 복사합니다. 사용자 스코프를 추가했다면 `xoxp-...` **User OAuth Token**도 복사합니다.
 
 > 스코프나 이벤트를 바꾸면 Slack이 노란색 "reinstall your app" 배너를 보여 줍니다. 변경 사항은 다시 설치한 뒤에야 적용됩니다.
 
@@ -191,6 +250,12 @@ OMP에서는 다음 순서로 설치합니다. 먼저 이 포크를 `~/.omp/agen
 | `im:read` | 선택 사항: 세션 관리를 위한 DM 메타데이터(`D`로 시작하는 채널 ID는 이 스코프 없이도 인식합니다) |
 | `users:read` | 선택 사항: 사용자 ID 대신 표시 이름 표시 |
 
+#### User Token 스코프(선택 사항)
+
+| 스코프(**User Token Scopes** 아래) | 필요한 기능 |
+| --- | --- |
+| `chat:write` | [오래된 상호작용을 정리할 때](#스레드-짧게-유지하기) 세션 스레드에서 *내 메시지*를 삭제. 정리 기능이 필요 없다면 생략합니다 |
+
 ### 3. 브리지에 토큰 전달하기
 
 대화형 메뉴로 Slack Bridge를 설정합니다:
@@ -200,12 +265,13 @@ OMP에서는 다음 순서로 설치합니다. 먼저 이 포크를 `~/.omp/agen
 # Select "Configure"
 # Enter bot token
 # Enter app token
+# Enter user token (선택 사항, 스레드 정리를 켭니다)
 ```
 
 또는 CLI로 설정합니다:
 
 ```bash
-/slk-bridge configure <bot-token> <app-token>
+/slk-bridge configure <bot-token> <app-token> [user-token]
 ```
 
 또는 환경 변수를 설정합니다(환경 변수는 `slk-bridge.json`에 절대 기록되지 않습니다):
@@ -213,6 +279,7 @@ OMP에서는 다음 순서로 설치합니다. 먼저 이 포크를 `~/.omp/agen
 ```bash
 export PI_SLACK_BOT_TOKEN="xoxb-your-slack-bot-token"
 export PI_SLACK_APP_TOKEN="xapp-your-slack-app-token"
+export PI_SLACK_USER_TOKEN="xoxp-your-slack-user-token"   # 선택 사항, 스레드 정리를 켭니다
 ```
 
 ### 4. 연결
@@ -253,7 +320,7 @@ export PI_SLACK_APP_TOKEN="xapp-your-slack-app-token"
 
 도입된 주요 명령은 다음과 같습니다:
 
-- `/slk-bridge new [path]` - 현재 Pi 세션을 종료하고 tmux 세션 안에서 새 세션을 시작합니다. 선택 인수(argument)로 `path`를 넣으면 OS의 해당 경로에서 세션을 시작합니다.
+- `/slk-bridge new <path>` - 현재 Pi 세션을 종료하고 tmux 세션 안에서 새 세션을 시작합니다. 시작 경로는 OS의 `path`입니다. 경로 없이 쓰는 `/slk-bridge new`는 다른 일을 합니다. 세션의 Slack 스레드를 정리합니다([스레드 짧게 유지하기](#스레드-짧게-유지하기) 참고).
 - `/slk-bridge resume` - Pi 에이전트의 최근 세션 10개를 보여 줍니다.
 - `/slk-bridge resume list [number]` - 최근 세션 `number`개를 보여 줍니다(기본값 10). `number`는 선택 인수입니다.
 - `/slk-bridge resume <number>` - `resume` 또는 `resume list` 출력에서 해당 번호가 가리키는 세션을 재개합니다. 기존 tmux 세션이 있으면 그 세션을 Pi 터미널 세션 전환에 사용합니다.
@@ -268,6 +335,7 @@ export PI_SLACK_APP_TOKEN="xapp-your-slack-app-token"
 
 사용자는 `.bridge`를 일종의 대체 수단으로 사용해 Pi의 일부 `/` 명령을 실행할 수 있습니다. 현재는 pi-slack-bridge 자체 명령 외에 `skills`와 `prompt templates`만 지원합니다.
 사용 가능한 명령을 모두 보려면 Slack에서 `.`을 보냅니다.
+`.bridge title <text>`, `.bridge new`, `.bridge keep <N>`, `.bridge pruneat <M>`은 스레드를 짧게 유지하는 명령입니다. [스레드 짧게 유지하기](#스레드-짧게-유지하기)에서 설명합니다.
 
 ![dot 명령 스크린샷](media/dot-commands-screenshot.png)
 
@@ -280,6 +348,7 @@ export PI_SLACK_APP_TOKEN="xapp-your-slack-app-token"
 - 세션별 받은편지함(Slack 메시지의 텍스트가 들어 있음): `~/.omp/agent/slk-bridge-inbox/`
 - 다운로드: `~/.pi/slk-bridge-downloads/slack/`
 - 환경 변수는 파일 설정보다 우선하며, 파일에 다시 기록되지 않습니다.
+- 선택 사항인 Slack **user token**은 다른 토큰들처럼 `slk-bridge.json`에 저장됩니다(`PI_SLACK_USER_TOKEN`은 파일에 다시 기록되지 않습니다). 이 토큰은 모듈 하나(`src/slack/guarded-delete.ts`)만 읽으며, 페어링된 DM 안에서 이 브리지의 스레드에 있는 내 메시지를 삭제하는 데만 씁니다. 자세한 내용은 [내 메시지 삭제를 위한 user token](#내-메시지-삭제를-위한-user-token)을 참고하세요.
 - 설정 갱신은 프로세스 간에 잠기고, 잠금 안에서 다시 읽은 뒤 원자적으로 교체합니다(임시 파일 + 이름 변경(rename)). 파싱할 수 없는 설정 파일은 절대 덮어쓰지 않습니다.
 - 챌린지 기반 인증(6자리 코드, 3회 시도, 2분 후 만료)
 - 전송 수단(transport)별 네임스페이스가 붙은 사용자 ID로 사칭을 막습니다.
@@ -311,6 +380,7 @@ export SLK_BRIDGE_DEBUG=true
 - **"Another session is the router"라고 나오는데 아무것도 수신되지 않을 때** — 그 프로세스가 멈췄을 수 있습니다. `/slk-bridge router`를 실행해 라우터 역할을 넘겨받으세요. 기존 라우터는 약 0.25초 안에 소켓을 닫습니다.
 - **`Refusing to overwrite ...: it is not valid JSON`** — `slk-bridge.json`이 손상되었거나 손으로 편집되었습니다. 브리지는 파싱할 수 없는 파일을 절대 덮어쓰지 않습니다. JSON을 고치거나 복원하세요.
 - **`Timed out waiting for the slk-bridge config lock`** — 다른 프로세스가 `slk-bridge.json.lock`을 잡고 있습니다. 5초보다 오래된 잠금은 비정상 종료로 남은 것으로 보고 자동으로 해제합니다. 실행 중인 `omp`가 없는데도 계속되면 잠금 파일을 삭제하세요.
+- **스레드가 정리되지 않을 때** — 정리에는 user token이 필요합니다(없으면 `/slk-bridge status`가 `Thread pruning: ... (off: no user token)`을 보여 줍니다). 그 밖에 스레드를 소유한 세션, 작업 중이 아닌 세션, 답변을 기다리는 `ask` 질문이 없는 상태가 필요하고, 스레드의 상호작용이 `threadPruneAt`개에 이르러야 시작합니다. 요약을 만들지 못했거나 쓰지 못하면 아무것도 삭제하지 않으며, 이유는 터미널에 표시됩니다. 삭제가 `cant_delete_message`나 `missing_scope`로 실패하면, user token이 신뢰된 Slack 사용자의 것이고 사용자 스코프 `chat:write`가 있는지 확인한 뒤 앱을 다시 설치하세요.
 - **핸드오버(handover)가 동작하지 않을 때** — 신뢰 Slack 사용자가 이미 브리지를 등록(claim)했는지 확인하세요. `/slk-bridge handover`에는 기억된 Slack DM 대상이 필요합니다.
 - **핸드오프(handoff)가 동작하지 않을 때** — tmux가 설치되어 있고 `pi`가 PATH에 있는지 확인하세요. 핸드오프는 tmux 안에서 `pi --session <target>`을 실행합니다.
 
@@ -340,7 +410,7 @@ pi -e src/bridge/index.ts
 npm run test
 ```
 
-테스트 스위트가 다루는 범위는 다음과 같습니다: 설정 로딩과 프로세스 간 안전한 갱신, 라우터 잠금(별도 프로세스에서 동시에 획득을 시도하는 경우 포함), 세션 레지스트리와 받은편지함, 수신 메시지 라우팅, 소켓 없는 발신 게시, 두 세션이 하나의 DM을 공유하는 종단 간(end-to-end) 동작, Slack 블록 분할, 대화 기록 추출, 서식. 일부 테스트는 파일 잠금을 검증하려고 실제 Node 프로세스를 시작합니다. 이 테스트는 몇 초 걸립니다.
+테스트 스위트가 다루는 범위는 다음과 같습니다: 설정 로딩과 프로세스 간 안전한 갱신, 라우터 잠금(별도 프로세스에서 동시에 획득을 시도하는 경우 포함), 세션 레지스트리와 받은편지함, 수신 메시지 라우팅, 소켓 없는 발신 게시, 두 세션이 하나의 DM을 공유하는 종단 간(end-to-end) 동작, Slack 블록 분할, 대화 기록 추출, 서식. 스레드 정리는 스레드를 상호작용으로 묶는 일과 보호된 삭제기(guarded deleter)의 거부 동작(다른 채널, 다른 사용자, 스레드 루트, 다른 스레드)부터, 가짜 Slack API로 메모리 안의 DM 스레드를 정리하는 브리지 전체 동작까지 검증합니다. 일부 테스트는 파일 잠금을 검증하려고 실제 Node 프로세스를 시작합니다. 이 테스트는 몇 초 걸립니다.
 
 ## 감사의 말
 

@@ -45,11 +45,19 @@ export function loadConfig(): SlackBridgeConfig {
   }
 
   // Environment variables override file config (higher priority)
-  if (process.env.PI_SLACK_BOT_TOKEN && process.env.PI_SLACK_APP_TOKEN) {
+  const envBotToken = process.env.PI_SLACK_BOT_TOKEN;
+  const envAppToken = process.env.PI_SLACK_APP_TOKEN;
+  const envUserToken = process.env.PI_SLACK_USER_TOKEN;
+  if (envBotToken && envAppToken) {
+    // The user token is optional and independent: keep the file's unless the environment provides one.
+    const userToken = envUserToken || config.slack?.userToken;
     config.slack = {
-      botToken: process.env.PI_SLACK_BOT_TOKEN,
-      appToken: process.env.PI_SLACK_APP_TOKEN,
+      botToken: envBotToken,
+      appToken: envAppToken,
+      ...(userToken ? { userToken } : {}),
     };
+  } else if (envUserToken && config.slack) {
+    config.slack = { ...config.slack, userToken: envUserToken };
   }
 
   return config;

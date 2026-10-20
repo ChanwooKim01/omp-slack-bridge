@@ -131,4 +131,43 @@ describe('inbound routing', () => {
       expect(getRememberedSlackThreadForCurrentSession('D999', () => OTHER_SESSION)).toBeUndefined();
     });
   });
+
+  describe('thread title and summary', () => {
+    const configFile = () => join(home, '.omp', 'agent', 'slk-bridge.json');
+
+    it('stores a title and summary per thread and merges later updates', async () => {
+      const { getSlackThreadMeta, updateSlackThreadMeta } = await importRouting();
+      expect(getSlackThreadMeta('D123', 'T1')).toBeUndefined();
+
+      updateSlackThreadMeta('D123', 'T1', { title: '[VLM_Verifier] MoT' });
+      updateSlackThreadMeta('D123', 'T1', { summary: '- 결정 하나', summaryTs: '1760000001.000100' });
+      // An unset field in a patch keeps what is stored.
+      updateSlackThreadMeta('D123', 'T1', { summary: '- 결정 둘', title: undefined });
+
+      expect(getSlackThreadMeta('D123', 'T1')).toMatchObject({
+        title: '[VLM_Verifier] MoT',
+        summary: '- 결정 둘',
+        summaryTs: '1760000001.000100',
+      });
+      expect(typeof getSlackThreadMeta('D123', 'T1')?.updatedAt).toBe('string');
+      expect(getSlackThreadMeta('D123', 'T2')).toBeUndefined();
+      expect(getSlackThreadMeta('C999', 'T1')).toBeUndefined();
+    });
+
+    it('keeps other threads, the thread mapping and other processes\' changes', async () => {
+      const { rememberSlackThreadForSession, updateSlackThreadMeta, getSlackThreadMeta, getSlackThreadOwnerSession } = await importRouting();
+      rememberSlackThreadForSession('D123', 'T1', ROUTER_SESSION);
+      updateSlackThreadMeta('D123', 'T1', { title: 'one' });
+
+      const onDisk = JSON.parse(readFileSync(configFile(), 'utf-8'));
+      onDisk.slackRouting.threadMeta['D123:T2'] = { title: 'written elsewhere', updatedAt: '2026-10-19T00:00:00.000Z' };
+      writeFileSync(configFile(), JSON.stringify(onDisk));
+      updateSlackThreadMeta('D123', 'T3', { title: 'three' });
+
+      expect(getSlackThreadMeta('D123', 'T1')?.title).toBe('one');
+      expect(getSlackThreadMeta('D123', 'T2')?.title).toBe('written elsewhere');
+      expect(getSlackThreadMeta('D123', 'T3')?.title).toBe('three');
+      expect(getSlackThreadOwnerSession('D123', 'T1')).toBe(ROUTER_SESSION);
+    });
+  });
 });

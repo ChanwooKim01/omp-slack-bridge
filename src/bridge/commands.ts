@@ -15,6 +15,8 @@ export interface BridgeStatus {
   autoConnect: boolean;
   trustedUser: string | undefined;
   channels: number;
+  /** Thread pruning: the settings in force, and whether a user token makes automatic pruning possible. */
+  threadPruning?: { keep: number; pruneAt: number; userToken: boolean };
 }
 
 export function buildBridgeStatusText(status: BridgeStatus): string {
@@ -33,6 +35,12 @@ export function buildBridgeStatusText(status: BridgeStatus): string {
     `Auto-claim router: ${status.autoConnect ? "on" : "off"}`,
     `Trusted user: ${status.trustedUser ?? "None"}`,
     `Channels: ${status.channels}`,
+    ...(status.threadPruning
+      ? [
+          `Thread pruning: keep ${status.threadPruning.keep}, prune at ${status.threadPruning.pruneAt}` +
+            (status.threadPruning.userToken ? "" : " (off: no user token)"),
+        ]
+      : []),
     "━━━━━━━━━━━━━━━━━━━━━━━━━━━",
   ];
 
@@ -79,7 +87,11 @@ export function buildRemoteCommandList(
     "- `.bridge status`",
     "- `.bridge connect`",
     "- `.bridge disconnect`",
-    "- `.bridge new [cwd]`",
+    "- `.bridge new` — summarize and clear this thread's history (needs a user token)",
+    "- `.bridge new <cwd>` — start a fresh tmux bridge session in <cwd>",
+    "- `.bridge title <text>` — set this thread's title",
+    "- `.bridge keep <N>` — keep the newest N interactions when threads are pruned (1-50, default 5)",
+    "- `.bridge pruneat <M>` — prune a thread once it holds M interactions (default 2x keep)",
     "- `.bridge resume`",
     "- `.bridge resume list [number]`",
     "- `.bridge resume <number>`",
@@ -103,11 +115,15 @@ export function buildBridgeHelpText(): string {
     "/slk-bridge connect           Join this session to the bridge (becomes router if none is live)",
     "/slk-bridge disconnect        Leave the bridge (releases the router role if held)",
     "/slk-bridge router            Take the router role (the one Slack socket) from another session",
-    "/slk-bridge configure <bot-token> <app-token>",
-    "                              Configure Slack bot",
+    "/slk-bridge configure <bot-token> <app-token> [user-token]",
+    "                              Configure Slack bot; the optional user token enables thread pruning",
     "/slk-bridge widget            Toggle status widget on/off",
     "/slk-bridge autoconnect       Toggle auto-claiming the router role when no router is live",
-    "/slk-bridge new [cwd]         Start a fresh bridge session for current or specified directory",
+    "/slk-bridge new               Summarize and clear this session's Slack thread (needs a user token)",
+    "/slk-bridge new <cwd>         Start a fresh bridge session in the given directory",
+    "/slk-bridge title <text>      Set this session's Slack thread title",
+    "/slk-bridge keep <N>          Keep the newest N interactions when threads are pruned (1-50, default 5)",
+    "/slk-bridge pruneat <M>       Prune a thread once it holds M interactions (default 2x keep)",
     "/slk-bridge resume             List recent sessions (default 10)",
     "/slk-bridge resume list [number]  Show more sessions (default 10)",
     "/slk-bridge resume <number>   Resume one of all recent sessions",

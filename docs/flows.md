@@ -151,4 +151,30 @@ Exactly one process holds the Slack connection at any time, every thread reaches
 
 ---
 
-_Add flows below. Number sequentially (FLOW-005, FLOW-006, ...)._
+## FLOW-005 — Keep a long session thread short
+
+**Actor:** trusted Slack user on a phone, talking to a session in its thread
+**Goal:** reach the newest messages of a long thread without scrolling, without losing what the older ones said
+
+### Steps (from the user's perspective)
+1. The user keeps working with a session in its thread. Each message of the user plus the bridge's answers to it is one interaction.
+2. After the answer to a Slack message is posted, the thread holds 10 or more interactions (`threadPruneAt`).
+3. The thread shrinks by itself: its root message now shows `**<title>**`, a blank line, `📝 지난 대화 요약` and a short summary; only the newest 5 interactions (`threadKeep`) remain below it.
+4. The user can steer it from the thread: `.bridge title <text>`, `.bridge new` (clear everything now), `.bridge keep <N>`, `.bridge pruneat <M>`.
+
+### Expected outcome
+The thread starts with a title and a summary of everything that was pruned, followed by the latest interactions. The summary never shows up as a normal reply, and the agent's own conversation is unchanged.
+
+### Acceptance criteria
+- [ ] Nothing is pruned below `threadPruneAt`, without a user token, while the session is working, while an `ask` question is pending in the thread, or in a thread the session does not own
+- [ ] The oldest `count − threadKeep` interactions are summarized (merged with the stored summary) and deleted; the newest `threadKeep` and the thread root are never deleted
+- [ ] If the summary cannot be made or written, nothing is deleted
+- [ ] A hand-written root title (`[VLM_Verifier] MoT`) is kept as the title; a user-written root gets its summary in one bot message that is never pruned
+- [ ] The user token only ever deletes the user's own replies in a thread of the paired DM; bot messages are deleted with the bot token
+- [ ] `.bridge new` summarizes and deletes everything and answers once afterwards; its replies, like all command replies, can be pruned later
+
+> **Test status:** ✅ Covered by `tests/slack/thread-history.test.ts`, `tests/slack/guarded-delete.test.ts`, `tests/bridge/thread-pruner.test.ts`, `tests/bridge/thread-settings.test.ts` and `tests/bridge/thread-pruning.test.ts` (a whole bridge against a fake Slack Web API).
+
+---
+
+_Add flows below. Number sequentially (FLOW-006, FLOW-007, ...)._
